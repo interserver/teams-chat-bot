@@ -1,0 +1,59 @@
+﻿{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.19/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.19",
+  "version": "1.0.0",
+  "id": "88bf36cc-aea6-44a1-bd63-cc05c4735ecf",
+  "developer": {
+    "name": "Microsoft",
+    "websiteUrl": "https://www.microsoft.com",
+    "privacyUrl": "https://www.microsoft.com/privacy",
+    "termsOfUseUrl": "https://www.microsoft.com/termsofuse"
+  },
+  "name": {
+    "short": "RSC Sample",
+    "full": "Channel messages with RSC"
+  },
+  "description": {
+    "short": "Bot receives all Teams channel messages using RSC permissions.",
+    "full": "This bot can capture all channel messages in Teams using RSC permissions, without the need for @mentions."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "bots": [
+    {
+      "botId": "6fa7ed27-9923-4d5a-9f2d-2c9b81cfdd2d",
+      "scopes": [
+        "team",
+        "personal",
+        "groupChat"
+      ],
+      "isNotificationOnly": false
+    }
+  ],
+  "accentColor": "#60A18E",
+  "permissions": [ "identity", "messageTeamMembers" ],
+  "validDomains": [
+    "mybot.interserver.net",
+    "token.botframework.com"
+  ],
+  "webApplicationInfo": {
+    "id": "6fa7ed27-9923-4d5a-9f2d-2c9b81cfdd2d",
+    "resource": "https://AnyString"
+  },
+  "authorization": {
+    "permissions": {
+      "resourceSpecific": [
+        {
+          "type": "Application",
+          "name": "ChannelMessage.Read.Group"
+        },
+        {
+          "type": "Application",
+          "name": "ChatMessage.Read.Chat"
+        }
+      ]
+    }
+  }
+}
