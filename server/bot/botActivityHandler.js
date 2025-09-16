@@ -9,6 +9,7 @@ const path = require('path');
 const Redis = require('ioredis');
 const { MongoClient } = require('mongodb');
 const mysql = require('mysql2/promise');
+const axios = require("axios");
 
 /*
 notifications 19:028421460efc48f89e00d1c7217bad63@thread.v2
@@ -187,7 +188,44 @@ class BotActivityHandler extends TeamsActivityHandler {
                     await context.sendActivity(MessageFactory.text('⚠️ Sorry, I couldn’t fetch a joke right now.'));
                 }
             } else if (ima === 'admin') {
-                if ((match = lcText.match(/^add mailbaby user (\S+) (\S+)$/i))) {
+                if ((match = lcText.match(/^add (bugs|hardware|new unassigned|general|int-1|migrations|level 2|billing|windows|host department|escalation|sales|security|new features) ticket (.*)$/msi))) {
+                    const dept = match[1];
+                    const name = member.name;
+                    const msg = match[2];
+                    // Trim, split into lines
+                    let lines = msg.trim().split(/\r?\n/);
+                    let subject, body;
+                    if (lines.length === 1) {
+                      subject = body = lines[0];
+                    } else {
+                      subject = lines[0];
+                      body = lines.slice(1).join("\n");
+                    }
+                    console.log("Subject:", subject);
+                    console.log("Message:", body);
+                    try {
+                        const response = await axios.post("https://mystage.interserver.net/admin/ajax/create_ticket.php",
+                            new URLSearchParams({subject,body,dept,email,name}),
+                            {headers: {"Content-Type": "application/x-www-form-urlencoded"}});
+                        if (response.status === 200) {
+                            await context.sendActivity(MessageFactory.text(response.data));
+                            console.log("✅ Success:", response.data);
+                        } else {
+                            await context.sendActivity(MessageFactory.text(response.data));
+                            console.log(`⚠️ Unexpected status ${response.status}:`, response.data);
+                        }
+                    } catch (error) {
+                        if (error.response) {
+                            await context.sendActivity(MessageFactory.text(error.response.data));
+                            console.log(`❌ Error ${error.response.status}:`, error.response.data);
+                        } else {
+                            await context.sendActivity(MessageFactory.text(error.message));
+                            console.log("❌ Request failed:", error.message);
+                        }
+                    }
+
+
+                } else if ((match = lcText.match(/^add mailbaby user (\S+) (\S+)$/i))) {
                     const user = match[1];
                     const pass = match[2];
                     const existing = await usersCollection.findOne({ username: user });
