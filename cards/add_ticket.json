@@ -18,8 +18,8 @@
                                         {
                                             "type": "Icon",
                                             "name": "TicketHorizontal",
-                                            "size": "xxSmall",
-                                            "color": "Accent"
+                                            "color": "Accent",
+                                            "size": "Small"
                                         }
                                     ],
                                     "verticalContentAlignment": "Center"
@@ -34,7 +34,8 @@
                                             "text": "Create Support Ticket",
                                             "wrap": true,
                                             "weight": "Bolder",
-                                            "color": "Accent"
+                                            "color": "Accent",
+                                            "size": "Large"
                                         }
                                     ],
                                     "verticalContentAlignment": "Center"
@@ -50,54 +51,71 @@
         {
             "items": [
                 {
-                    "type": "Input.ChoiceSet",
-                    "label": "Status",
-                    "choices": [
+                    "type": "ColumnSet",
+                    "columns": [
                         {
-                            "title": "Open",
-                            "value": "4"
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "type": "Input.ChoiceSet",
+                                    "label": "Status",
+                                    "choices": [
+                                        {
+                                            "title": "Open",
+                                            "value": "4"
+                                        },
+                                        {
+                                            "title": "On Hold",
+                                            "value": "5"
+                                        },
+                                        {
+                                            "title": "Closed",
+                                            "value": "6"
+                                        },
+                                        {
+                                            "title": "In Progress",
+                                            "value": "7"
+                                        }
+                                    ],
+                                    "placeholder": "Select Status",
+                                    "id": "status",
+                                    "isRequired": true,
+                                    "errorMessage": "Status is required",
+                                    "value": "4"
+                                }
+                            ]
                         },
                         {
-                            "title": "On Hold",
-                            "value": "5"
-                        },
-                        {
-                            "title": "Closed",
-                            "value": "6"
-                        },
-                        {
-                            "title": "In Progress",
-                            "value": "7"
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "type": "Input.ChoiceSet",
+                                    "label": "Priority",
+                                    "choices": [
+                                        {
+                                            "title": "Standard",
+                                            "value": "7"
+                                        },
+                                        {
+                                            "title": "Emergency",
+                                            "value": "8"
+                                        },
+                                        {
+                                            "title": "Critical",
+                                            "value": "9"
+                                        }
+                                    ],
+                                    "placeholder": "Select Priority",
+                                    "id": "priority",
+                                    "isRequired": true,
+                                    "errorMessage": "Priority is required",
+                                    "value": "7"
+                                }
+                            ]
                         }
-                    ],
-                    "placeholder": "Select Status",
-                    "id": "status",
-                    "isRequired": true,
-                    "errorMessage": "Status is required",
-                    "value": "4"
-                },
-                {
-                    "type": "Input.ChoiceSet",
-                    "label": "Priority",
-                    "choices": [
-                        {
-                            "title": "Standard",
-                            "value": "7"
-                        },
-                        {
-                            "title": "Emergency",
-                            "value": "8"
-                        },
-                        {
-                            "title": "Critical",
-                            "value": "9"
-                        }
-                    ],
-                    "placeholder": "Select Priority",
-                    "id": "priority",
-                    "isRequired": true,
-                    "errorMessage": "Priority is required",
-                    "value": "7"
+                    ]
                 }
             ],
             "layouts": [
@@ -113,108 +131,161 @@
             "type": "Container"
         },
         {
-            "choices": [
+            "type": "Container",
+            "items": [
                 {
-                    "title": "New Unassigned",
-                    "value": "18"
-                },
-                {
-                    "title": "Mail Baby",
-                    "value": "28"
-                },
-                {
-                    "title": "General",
-                    "value": "5"
-                },
-                {
-                    "title": "  >  int-1",
-                    "value": "13"
-                },
-                {
-                    "title": "Migrations",
-                    "value": "17"
-                },
-                {
-                    "title": "Level 2",
-                    "value": "19"
-                },
-                {
-                    "title": "Billing",
-                    "value": "2"
-                },
-                {
-                    "title": "Hardware",
-                    "value": "6"
-                },
-                {
-                    "title": "  >  Provisioning",
-                    "value": "26"
-                },
-                {
-                    "title": "  >  hardware-modifications",
-                    "value": "27"
-                },
-                {
-                    "title": "Windows",
-                    "value": "7"
-                },
-                {
-                    "title": "  >  Win-Migrations",
-                    "value": "24"
-                },
-                {
-                    "title": "  >  Win-Escalations",
-                    "value": "25"
-                },
-                {
-                    "title": "Host Department",
-                    "value": "10"
-                },
-                {
-                    "title": "HDbilling",
-                    "value": "12"
-                },
-                {
-                    "title": "Escalation",
-                    "value": "4"
-                },
-                {
-                    "title": "Sales",
-                    "value": "15"
-                },
-                {
-                    "title": "  >  Legal",
-                    "value": "23"
-                },
-                {
-                    "title": "Developer Escalation",
-                    "value": "14"
-                },
-                {
-                    "title": "  >  Security",
-                    "value": "20"
-                },
-                {
-                    "title": "  >  New Features",
-                    "value": "21"
-                },
-                {
-                    "title": "  >  Bugs",
-                    "value": "22"
-                },
-                {
-                    "title": "Abuse",
-                    "value": "16"
+                    "type": "ColumnSet",
+                    "columns": [
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "type": "Input.ChoiceSet",
+                                    "label": "Type",
+                                    "choices": [
+                                        {
+                                            "title": "Issue",
+                                            "value": "1"
+                                        },
+                                        {
+                                            "title": "Task",
+                                            "value": "2"
+                                        },
+                                        {
+                                            "title": "Bug",
+                                            "value": "3"
+                                        },
+                                        {
+                                            "title": "Lead",
+                                            "value": "4"
+                                        },
+                                        {
+                                            "title": "Feedback",
+                                            "value": "5"
+                                        }
+                                    ],
+                                    "placeholder": "Select Type",
+                                    "isRequired": true,
+                                    "errorMessage": "Type is required",
+                                    "value": "1",
+                                    "id": "type"
+                                }
+                            ]
+                        },
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "choices": [
+                                        {
+                                            "title": "New Unassigned",
+                                            "value": "18"
+                                        },
+                                        {
+                                            "title": "Mail Baby",
+                                            "value": "28"
+                                        },
+                                        {
+                                            "title": "General",
+                                            "value": "5"
+                                        },
+                                        {
+                                            "title": "  >  int-1",
+                                            "value": "13"
+                                        },
+                                        {
+                                            "title": "Migrations",
+                                            "value": "17"
+                                        },
+                                        {
+                                            "title": "Level 2",
+                                            "value": "19"
+                                        },
+                                        {
+                                            "title": "Billing",
+                                            "value": "2"
+                                        },
+                                        {
+                                            "title": "Hardware",
+                                            "value": "6"
+                                        },
+                                        {
+                                            "title": "  >  Provisioning",
+                                            "value": "26"
+                                        },
+                                        {
+                                            "title": "  >  hardware-modifications",
+                                            "value": "27"
+                                        },
+                                        {
+                                            "title": "Windows",
+                                            "value": "7"
+                                        },
+                                        {
+                                            "title": "  >  Win-Migrations",
+                                            "value": "24"
+                                        },
+                                        {
+                                            "title": "  >  Win-Escalations",
+                                            "value": "25"
+                                        },
+                                        {
+                                            "title": "Host Department",
+                                            "value": "10"
+                                        },
+                                        {
+                                            "title": "HDbilling",
+                                            "value": "12"
+                                        },
+                                        {
+                                            "title": "Escalation",
+                                            "value": "4"
+                                        },
+                                        {
+                                            "title": "Sales",
+                                            "value": "15"
+                                        },
+                                        {
+                                            "title": "  >  Legal",
+                                            "value": "23"
+                                        },
+                                        {
+                                            "title": "Developer Escalation",
+                                            "value": "14"
+                                        },
+                                        {
+                                            "title": "  >  Security",
+                                            "value": "20"
+                                        },
+                                        {
+                                            "title": "  >  New Features",
+                                            "value": "21"
+                                        },
+                                        {
+                                            "title": "  >  Bugs",
+                                            "value": "22"
+                                        },
+                                        {
+                                            "title": "Abuse",
+                                            "value": "16"
+                                        }
+                                    ],
+                                    "errorMessage": "Department is required",
+                                    "id": "department",
+                                    "isRequired": true,
+                                    "label": "Department",
+                                    "type": "Input.ChoiceSet",
+                                    "value": "5",
+                                    "placeholder": "Select Department"
+                                }
+                            ]
+                        }
+                    ]
                 }
             ],
-            "errorMessage": "Duration is required",
-            "id": "department",
-            "isRequired": true,
-            "label": "Department",
-            "spacing": "Medium",
-            "type": "Input.ChoiceSet",
-            "value": "5",
-            "placeholder": "Select Department"
+            "spacing": "Medium"
         },
         {
             "id": "subject",
