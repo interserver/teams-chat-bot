@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-const { TurnContext, TeamsInfo, TeamsActivityHandler, MessageFactory } = require('botbuilder');
+const { TurnContext, TeamsInfo, TeamsActivityHandler, CardFactory, MessageFactory } = require('botbuilder');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
@@ -188,7 +188,71 @@ class BotActivityHandler extends TeamsActivityHandler {
                     await context.sendActivity(MessageFactory.text('⚠️ Sorry, I couldn’t fetch a joke right now.'));
                 }
             } else if (ima === 'admin') {
-                if ((match = lcText.match(/^add (bugs|hardware|new unassigned|general|int-1|migrations|level 2|billing|windows|host department|escalation|sales|security|new features) ticket (.*)$/msi))) {
+                if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketSubmit") {
+                    console.log(context.activity);
+                    try {
+                        const subject = context.activity.value.subject;
+                        const body = context.activity.value.contents;
+                        const dept = context.activity.value.department;
+                        const notes = context.activity.value.notes;
+                        const priority = context.activity.value.priority;
+                        const status = context.activity.value.status;
+                        const type = context.activity.value.type;
+                        const name = member.name;
+                        const response = await axios.post("https://mystage.interserver.net/admin/ajax/create_ticket.php",
+                            new URLSearchParams({subject, body, dept, email, name, priority, status, type, notes}),
+                            {headers: {"Content-Type": "application/x-www-form-urlencoded"}});
+                        if (response.status === 200) {
+                            //await context.sendActivity(MessageFactory.text(response.data));
+                            await context.updateActivity({
+                                type: 'message',
+                                id: context.activity.value.activityId,
+                                conversation: context.activity.conversation,
+                                text: response.data
+                            });
+                            console.log("✅ Success:", response.data);
+                        } else {
+                            await context.sendActivity(MessageFactory.text(response.data));
+                            console.log(`⚠️ Unexpected status ${response.status}:`, response.data);
+                        }
+                    } catch (error) {
+                        if (error.response) {
+                            await context.sendActivity(MessageFactory.text(error.response.data));
+                            console.log(`❌ Error ${error.response.status}:`, error.response.data);
+                        } else {
+                            await context.sendActivity(MessageFactory.text(error.message));
+                            console.log("❌ Request failed:", error.message);
+                        }
+                    }
+                }
+                if (lcText === 'add ticket') {
+                    const cardPath = path.join(__dirname, '../../cards/add_ticket.json');
+                    let cardContents = JSON.parse(fs.readFileSync(cardPath, 'utf8'));
+                    // Send the card first to get the activityId
+                    const sentActivity = await context.sendActivity({
+                        attachments: [CardFactory.adaptiveCard(cardContents)]
+                    });
+
+                    // Find the ActionSet in the card body and update Action.Submit data
+                    cardContents.body.forEach(element => {
+                        if (element.type === "ActionSet" && Array.isArray(element.actions)) {
+                            element.actions.forEach(action => {
+                                if (action.type === "Action.Submit") {
+                                    action.data = action.data || {};
+                                    action.data.activityId = sentActivity.id;
+                                    action.data.msteams = { type: "addTicketSubmit" };
+                                }
+                            });
+                        }
+                    });
+                    // Replace the card message with the new card including activityId
+                    await context.updateActivity({
+                        type: 'message',
+                        id: sentActivity.id,
+                        conversation: context.activity.conversation,
+                        attachments: [CardFactory.adaptiveCard(cardContents)]
+                    });
+                } else if ((match = lcText.match(/^add (bugs|hardware|new unassigned|general|int-1|migrations|level 2|billing|windows|host department|escalation|sales|security|new features) ticket (.*)$/msi))) {
                     const dept = match[1];
                     const name = member.name;
                     const msg = match[2];
@@ -345,6 +409,19 @@ class BotActivityHandler extends TeamsActivityHandler {
             }
             await next();
         });
+
+/*)        // called when card action is taken
+        // Correct way to handle Adaptive Card submit actions in Teams
+        this.onInvokeActivity(async (context, next) => {
+            console.log('got onTeamsCardActionInvoke event');
+            console.log(context.activity);
+            if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketSubmit") {
+                await context.sendActivity(MessageFactory.text("Ticket submission received! 🎟️"));
+                await context.sendActivity("Ticket submission received! 🎟️");
+            }
+            await next();
+        });
+*/
 
         // Called when the bot is added to a team.
         this.onMembersAdded(async (context, next) => {
