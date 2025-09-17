@@ -194,13 +194,17 @@ class BotActivityHandler extends TeamsActivityHandler {
                         const subject = context.activity.value.subject;
                         const body = context.activity.value.contents;
                         const dept = context.activity.value.department;
-                        const notes = context.activity.value.notes;
                         const priority = context.activity.value.priority;
                         const status = context.activity.value.status;
                         const type = context.activity.value.type;
                         const name = member.name;
+                        let params = {subject, body, dept, email, name, priority, status, type};
+                        // only add notes if it’s defined and not empty
+                        if (context.activity.value.notes) {
+                            params.notes = context.activity.value.notes;
+                        }
                         const response = await axios.post("https://mystage.interserver.net/admin/ajax/create_ticket.php",
-                            new URLSearchParams({subject, body, dept, email, name, priority, status, type, notes}),
+                            new URLSearchParams(params),
                             {headers: {"Content-Type": "application/x-www-form-urlencoded"}});
                         if (response.status === 200) {
                             //await context.sendActivity(MessageFactory.text(response.data));
