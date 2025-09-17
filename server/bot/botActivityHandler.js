@@ -236,19 +236,8 @@ class BotActivityHandler extends TeamsActivityHandler {
                     const sentActivity = await context.sendActivity({
                         attachments: [CardFactory.adaptiveCard(cardContents)]
                     });
-
-                    // Find the ActionSet in the card body and update Action.Submit data
-                    cardContents.body.forEach(element => {
-                        if (element.type === "ActionSet" && Array.isArray(element.actions)) {
-                            element.actions.forEach(action => {
-                                if (action.type === "Action.Submit") {
-                                    action.data = action.data || {};
-                                    action.data.activityId = sentActivity.id;
-                                    action.data.msteams = { type: "addTicketSubmit" };
-                                }
-                            });
-                        }
-                    });
+                    // Call it on the root card
+                    cardContents.body.forEach(element => this.updateActionSubmitData(element, sentActivity));
                     // Replace the card message with the new card including activityId
                     await context.updateActivity({
                         type: 'message',
@@ -584,6 +573,28 @@ class BotActivityHandler extends TeamsActivityHandler {
     isValidHostname(input) {
         const hostname = /^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$/;
         return hostname.test(input);
+    }
+
+    updateActionSubmitData(element, sentActivity) {
+        if (element.type === "ActionSet" && Array.isArray(element.actions)) {
+            element.actions.forEach(action => {
+                if (action.type === "Action.Submit") {
+                    action.data = action.data || {};
+                    action.data.activityId = sentActivity.id;
+                    action.data.msteams = { type: "addTicketSubmit" };
+                }
+            });
+        }
+        // Recurse into known containers
+        if (Array.isArray(element.items)) {
+            element.items.forEach(item => this.updateActionSubmitData(item, sentActivity));
+        }
+        if (Array.isArray(element.columns)) {
+            element.columns.forEach(col => this.updateActionSubmitData(col, sentActivity));
+        }
+        if (Array.isArray(element.body)) {
+            element.body.forEach(child => this.updateActionSubmitData(child, sentActivity));
+        }
     }
 }
 

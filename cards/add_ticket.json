@@ -46,7 +46,7 @@
                     ]
                 }
             ],
-            "spacing": "Medium"
+            "spacing": "None"
         },
         {
             "items": [
@@ -82,7 +82,8 @@
                                     "id": "status",
                                     "isRequired": true,
                                     "errorMessage": "Status is required",
-                                    "value": "4"
+                                    "value": "4",
+                                    "spacing": "None"
                                 }
                             ]
                         },
@@ -111,7 +112,8 @@
                                     "id": "priority",
                                     "isRequired": true,
                                     "errorMessage": "Priority is required",
-                                    "value": "7"
+                                    "value": "7",
+                                    "spacing": "None"
                                 }
                             ]
                         }
@@ -127,7 +129,7 @@
                     "type": "Layout.Flow"
                 }
             ],
-            "spacing": "Medium",
+            "spacing": "None",
             "type": "Container"
         },
         {
@@ -169,7 +171,8 @@
                                     "isRequired": true,
                                     "errorMessage": "Type is required",
                                     "value": "1",
-                                    "id": "type"
+                                    "id": "type",
+                                    "spacing": "None"
                                 }
                             ]
                         },
@@ -278,20 +281,21 @@
                                     "label": "Department",
                                     "type": "Input.ChoiceSet",
                                     "value": "5",
-                                    "placeholder": "Select Department"
+                                    "placeholder": "Select Department",
+                                    "spacing": "None"
                                 }
                             ]
                         }
                     ]
                 }
             ],
-            "spacing": "Medium"
+            "spacing": "None"
         },
         {
             "id": "subject",
             "label": "Subject",
             "placeholder": "Enter subject of ticket",
-            "spacing": "Medium",
+            "spacing": "None",
             "type": "Input.Text",
             "isRequired": true,
             "errorMessage": "Subject is required"
@@ -303,7 +307,8 @@
             "id": "contents",
             "isMultiline": true,
             "isRequired": true,
-            "errorMessage": "Contents are required."
+            "errorMessage": "Contents are required.",
+            "spacing": "None"
         },
         {
             "columns": [
@@ -362,9 +367,33 @@
                     "type": "Column",
                     "verticalContentAlignment": "Center",
                     "width": "auto"
+                },
+                {
+                    "type": "Column",
+                    "width": "stretch",
+                    "items": [
+                        {
+                            "actions": [
+                                {
+                                    "style": "positive",
+                                    "title": "Submit",
+                                    "type": "Action.Submit",
+                                    "data": {
+                                        "msteams": {
+                                            "type": "addTicketSubmit"
+                                        }
+                                    }
+                                }
+                            ],
+                            "separator": true,
+                            "spacing": "None",
+                            "type": "ActionSet",
+                            "horizontalAlignment": "Right"
+                        }
+                    ]
                 }
             ],
-            "spacing": "Medium",
+            "spacing": "None",
             "type": "ColumnSet"
         },
         {
@@ -372,25 +401,8 @@
             "isMultiline": true,
             "isVisible": false,
             "placeholder": "Enter any additional notes",
-            "spacing": "Small",
+            "spacing": "None",
             "type": "Input.Text"
-        },
-        {
-            "actions": [
-                {
-                    "style": "positive",
-                    "title": "Submit",
-                    "type": "Action.Submit",
-                    "data": {
-                        "msteams": {
-                            "type": "addTicketSubmit"
-                        }
-                    }
-                }
-            ],
-            "separator": true,
-            "spacing": "Medium",
-            "type": "ActionSet"
         }
     ],
     "type": "AdaptiveCard",
