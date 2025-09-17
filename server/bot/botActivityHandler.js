@@ -188,7 +188,15 @@ class BotActivityHandler extends TeamsActivityHandler {
                     await context.sendActivity(MessageFactory.text('⚠️ Sorry, I couldn’t fetch a joke right now.'));
                 }
             } else if (ima === 'admin') {
-                if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketSubmit") {
+                if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketCancel") {
+                    console.log(context.activity);
+                    await context.updateActivity({
+                        type: 'message',
+                        id: context.activity.value.activityId,
+                        conversation: context.activity.conversation,
+                        text: 'Add ticket canceled'
+                    });
+                } else if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketSubmit") {
                     console.log(context.activity);
                     try {
                         const subject = context.activity.value.subject;
@@ -579,9 +587,7 @@ class BotActivityHandler extends TeamsActivityHandler {
         if (element.type === "ActionSet" && Array.isArray(element.actions)) {
             element.actions.forEach(action => {
                 if (action.type === "Action.Submit") {
-                    action.data = action.data || {};
                     action.data.activityId = sentActivity.id;
-                    action.data.msteams = { type: "addTicketSubmit" };
                 }
             });
         }

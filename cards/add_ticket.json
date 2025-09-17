@@ -297,7 +297,6 @@
             "placeholder": "Enter subject of ticket",
             "spacing": "None",
             "type": "Input.Text",
-            "isRequired": true,
             "errorMessage": "Subject is required"
         },
         {
@@ -306,7 +305,6 @@
             "placeholder": "Enter ticket contents here",
             "id": "contents",
             "isMultiline": true,
-            "isRequired": true,
             "errorMessage": "Contents are required.",
             "spacing": "None"
         },
@@ -383,6 +381,16 @@
                                             "type": "addTicketSubmit"
                                         }
                                     }
+                                },
+                                {
+                                    "type": "Action.Submit",
+                                    "title": "Cancel",
+                                    "style": "destructive",
+                                    "data": {
+                                        "msteams": {
+                                            "type": "addTicketCancel"
+                                        }
+                                    }
                                 }
                             ],
                             "separator": true,
@@ -390,11 +398,13 @@
                             "type": "ActionSet",
                             "horizontalAlignment": "Right"
                         }
-                    ]
+                    ],
+                    "horizontalAlignment": "Right"
                 }
             ],
             "spacing": "None",
-            "type": "ColumnSet"
+            "type": "ColumnSet",
+            "horizontalAlignment": "Right"
         },
         {
             "id": "notes",
