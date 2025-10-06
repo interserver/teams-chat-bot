@@ -25,7 +25,7 @@ class BotActivityHandler extends TeamsActivityHandler {
         super();
 
         // MySQL
-        const db = mysql.createPool({
+        this.db = mysql.createPool({
             host: process.env.MYSQL_HOST,
             user: process.env.MYSQL_USER,
             password: process.env.MYSQL_PASS,
@@ -34,7 +34,7 @@ class BotActivityHandler extends TeamsActivityHandler {
             connectionLimit: 10,
             queueLimit: 0
         });
-        db.getConnection()
+        this.db.getConnection()
             .then((conn) => {
                 console.log("✅ Connected to MySQL");
                 conn.release();
@@ -59,45 +59,31 @@ class BotActivityHandler extends TeamsActivityHandler {
         this.hostRegex = /(?<host>([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,})/;
         this.emailRegex = /(?<email>[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
 
+        this.masterTables = {backup_masters: 'backup', website_masters: 'website', vps_masters: 'vps', qs_masters: 'qs'};
+        this.tableFields = {backup_masters: [], website_masters: [], vps_masters: [], qs_masters: []};
+        this.detailTables = ['vps_masters', 'qs_masters'];
+        for (let table in this.masterTables) {
+            let prefix = this.masterTables[table];
+            this.db.query(`DESCRIBE ??`, [table])  // use ?? for identifiers instead of ?
+            .then(([rows]) => {
+                if (rows && rows.length > 0) {
+                    rows.forEach(row => {
+                        let field = row.Field.replace(prefix + '_', '');
+                        this.tableFields[table].push(field);
+                    });
+                }
+            }).catch(err => {
+                console.error(`Error describing table ${table}:`, err);
+            });
+        }
+
         // Activity called when there's a message in channel
         this.onMessage(async (context, next) => {
-
             // conversationReference includes serviceUrl, user, bot, and conversation.id
             const conversationReference = TurnContext.getConversationReference(context.activity);
             //console.log(conversationReference);
-
             // store it somewhere (Redis, Mongo, MySQL, etc.)
             await this.redis.set(`convref:${conversationReference.conversation.id}`, JSON.stringify(conversationReference));
-
-            /* context.activity:
-            {
-              text: '1',
-              textFormat: 'plain',
-              attachments: [ { contentType: 'text/html', content: '<p>1</p>' } ],
-              type: 'message',
-              id: '1755495760922',
-              channelId: 'msteams',
-              serviceUrl: 'https://smba.trafficmanager.net/amer/7837f8c1-952c-4ce2-8d54-6ef28f5cdfef/',
-              from: {
-                id: '29:1Tg_ijIGbNJjZZpPViCdFXG7adkoazSTdXmr79tYDeQtivdqiCe4Q3DDbUdxCriDHjzDMfTG-xBWAY971Kr9aRA',
-                name: 'Joe Huss',
-                aadObjectId: 'c64d7672-0cd2-4d0d-9a9f-7bac202f49b4'
-              },
-              conversation: {
-                conversationType: 'personal',   channel / personal / groupChat
-                tenantId: '7837f8c1-952c-4ce2-8d54-6ef28f5cdfef',
-                id: 'a:1sU2r-PV8_UqBYLCy4cplte8M37bxk6frzVlrNJjc7CJmLzqWtT07Ll9bgdMaj_47UPUd7vBolBlmA3vTnfiz6-KLZHy-TTeyG2-oQ3MbAXibkX-4KJpZGRInAU2V4HpC'
-              },
-              recipient: {
-                id: '28:6fa7ed27-9923-4d5a-9f2d-2c9b81cfdd2d',
-                name: 'InterestingGuy'
-              },
-              channelData: { tenant: { id: '7837f8c1-952c-4ce2-8d54-6ef28f5cdfef' } },
-              locale: 'en-US',
-              localTimezone: 'America/New_York',
-              callerId: 'urn:botframework:azure'
-            }
-            */
             const text = (context.activity.text || '').trim();
             const lcText = text.toLowerCase();
             const userId = context.activity.from.id;
@@ -138,7 +124,7 @@ class BotActivityHandler extends TeamsActivityHandler {
             //console.log(context.activity);
             // console.log('Member:');
             //console.log(member);
-            const [accountRow] = await db.query('select * from accounts where account_lid=?', [email]);
+            const [accountRow] = await this.db.query('select * from accounts where account_lid=?', [email]);
             const ima = !accountRow || accountRow.length === 0 ? 'unknown' : accountRow[0].account_ima;
             console.log(`#${channelId} [${ima}] ${member.name} <${email}> sent message: ${text}`);
             let match;
@@ -188,8 +174,30 @@ class BotActivityHandler extends TeamsActivityHandler {
                     await context.sendActivity(MessageFactory.text('⚠️ Sorry, I couldn’t fetch a joke right now.'));
                 }
             } else if (ima === 'admin') {
-                if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketCancel") {
-                    console.log(context.activity);
+                if ((match = lcText.match(/^(mark|set) (\S+) (1|0|unavailable|available|enabled|disabled|disable|enable|off|on|usable|unusable)$/i))) {
+                    const server = match[2];
+                    const value = match[3].toLowerCase();
+                    const valuesOn = ['1', 'available', 'enabled', 'enable', 'on', 'usable'];
+                    const valuesOff = ['0', 'unavailable', 'disabled', 'disable', 'off', 'unusable'];
+                    if (valuesOn.includes(value)) {
+                        await this.setMaster(context, server, 'available', '1');
+                    } else if (valuesOff.includes(value)) {
+                        await this.setMaster(context, server, 'available', '0');
+                    } else {
+                        console.log(`Value ${value} not recognized`);
+                    }
+                } else if ((match = lcText.match(/^(mark|set) (\S+) (\S+)( | *= *| *to *)(\S+)$/i))) {
+                    const server = match[2];
+                    const field = match[3];
+                    const value = match[5];
+                    await this.setMaster(context, server, field, value);
+                } else if ((match = lcText.match(/^(mark|set) (\S+) on (\S+)( | *= *| *to *)(\S+)$/i))) {
+                    const field = match[2];
+                    const server = match[3];
+                    const value = match[5];
+                    await this.setMaster(context, server, field, value);
+                } else if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketCancel") {
+                    console.log(context.activity.value);
                     await context.updateActivity({
                         type: 'message',
                         id: context.activity.value.activityId,
@@ -197,7 +205,7 @@ class BotActivityHandler extends TeamsActivityHandler {
                         text: 'Add ticket canceled'
                     });
                 } else if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketSubmit") {
-                    console.log(context.activity);
+                    console.log(context.activity.value);
                     try {
                         const subject = context.activity.value.subject;
                         const body = context.activity.value.contents;
@@ -315,7 +323,7 @@ class BotActivityHandler extends TeamsActivityHandler {
                     }
                 } else if ((match = text.match(/.*(where|lookup|query|find|locate|search).*?[^\d](\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[^\d]?.*/i))) {
                     const ip = match[2];
-                    const [rows] = await db.query(
+                    const [rows] = await this.db.query(
                         `SELECT *, assets.id AS real_asset_id
                         FROM ips
                         LEFT JOIN vlans ON ips_vlan=vlans_id
@@ -407,6 +415,34 @@ class BotActivityHandler extends TeamsActivityHandler {
                     }
                     await context.sendActivity(MessageFactory.text(text));
                 }
+/* TODO:
+- Github Issues
+    'issues list' => ['params' => [], 'description' => 'List all open issues'],
+    'issues show <id>' => ['params' => ['id'], 'description' => 'Show details of a specific issue'],
+    'issues close <id> [comment]' => ['params' => ['id', 'comment'], 'description' => 'Close an issue with an optional comment'],
+    'issues comment <id> <comment>' => ['params' => ['id', 'comment'], 'description' => 'Add a comment to an issue'],
+    'issues create <title> [body]' => ['params' => ['title', 'body'], 'description' => 'Create a new issue'],
+    'labels list' => ['params' => [], 'description' => 'List all labels'],
+    'label create <name> <color> [description]' => ['params' => ['name', 'color', 'description'], 'description' => 'Create a new label'],
+    'label update <name> <new_name> <color> [description]' => ['params' => ['name', 'new_name', 'color', 'description'], 'description' => 'Update an existing label'],
+    'label add <issue_id> <label>' => ['params' => ['issue_id', 'label'], 'description' => 'Add a label to an issue'],
+    'label remove <issue_id> <label>' => ['params' => ['issue_id', 'label'], 'description' => 'Remove a label from an issue'],
+    'github help' => ['params' => [], 'description' => 'Show all available GitHub commands']
+- Datacenterd Related
+    get global <var>
+    set global <var>\
+    hyperv status
+    processing status
+- Service Master commands
+    (mark|set) [server] (1|0|unavailable|available|enabled|disabled|disable|enable) - sets the available flag on a host master, ie: mark hyperv26 available
+    (mark|set) [server] [field] [value] - sets the field for server to value
+    (mark|set) [server] [field]=[value]
+    (mark|set) [server] [field] to [value]
+    (mark|set) [field] on [server] to [value]
+    (mark|set) [field] on [server]=[value]
+    (mark|set) [field] on [server] [value]
+
+*/
             }
             await next();
         });
@@ -600,6 +636,42 @@ class BotActivityHandler extends TeamsActivityHandler {
         }
         if (Array.isArray(element.body)) {
             element.body.forEach(child => this.updateActionSubmitData(child, sentActivity));
+        }
+    }
+
+    async setMaster(context, server, field, value) {
+        let found = false;
+        for (let table in this.masterTables) {
+            const prefix = this.masterTables[table];
+            const nameField = prefix + "_name";
+            try {
+                const [rows] = await this.db.query(`SELECT * FROM ?? WHERE ?? = ? LIMIT 1`, [table, nameField, server]);
+                if (rows && rows.length > 0) {
+                    server = rows[0][nameField];
+                    if (this.tableFields[table].includes(field)) {
+                        if (rows[0][prefix+"_available"] == value) {
+                            await context.sendActivity(MessageFactory.text(`${server} in ${table} is already marked available=${value}`));
+                            console.log(`${server} in ${table} is already marked available=${value}`);
+                        } else {
+                            await this.db.query(`UPDATE ?? SET ?? = ? WHERE ?? = ?`,[table, prefix+"_"+field, value, nameField, server]);
+                            await context.sendActivity(MessageFactory.text(`Updated ${field}=${value} in ${table} where ${nameField} = ${server}`));
+                            console.log(`Updated ${field}=${value} in ${table} where ${nameField} = ${server}`);
+                        }
+                    } else {
+                        await context.sendActivity(MessageFactory.text(`field ${field} does not exist for ${server} in ${table}`));
+                        console.log(`field ${field} does not exist for ${server} in ${table}`);
+                    }
+                    found = true;
+                    break; // stop after first match
+                }
+            } catch (err) {
+                await context.sendActivity(MessageFactory.text(`Error querying table ${table}:`, err));
+                console.error(`Error querying table ${table}:`, err);
+            }
+        }
+        if (!found) {
+            await context.sendActivity(MessageFactory.text(`No matching server "${server}" found in any master table`));
+            console.log(`No matching server "${server}" found in any master table`);
         }
     }
 }
