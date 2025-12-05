@@ -433,15 +433,6 @@ class BotActivityHandler extends TeamsActivityHandler {
     set global <var>\
     hyperv status
     processing status
-- Service Master commands
-    (mark|set) [server] (1|0|unavailable|available|enabled|disabled|disable|enable) - sets the available flag on a host master, ie: mark hyperv26 available
-    (mark|set) [server] [field] [value] - sets the field for server to value
-    (mark|set) [server] [field]=[value]
-    (mark|set) [server] [field] to [value]
-    (mark|set) [field] on [server] to [value]
-    (mark|set) [field] on [server]=[value]
-    (mark|set) [field] on [server] [value]
-
 */
             }
             await next();
