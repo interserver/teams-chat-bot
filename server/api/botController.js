@@ -9,7 +9,42 @@ const {
     ConfigurationBotFrameworkAuthentication, */
     BotFrameworkAdapter
 } = require('botbuilder');
+const { MicrosoftAppCredentials } = require('botframework-connector');
 const { BotActivityHandler } = require('../bot/botActivityHandler');
+
+const TRANSIENT_RE = /ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i;
+const AUTH_ERROR_RE = /authorization has been denied|401|unauthorized/i;
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 1000;
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function runWithRetry(context, handler) {
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            await handler(context);
+            return; // success
+        } catch (err) {
+            const msg = err.message || '';
+            const isTransient = TRANSIENT_RE.test(msg);
+            const isAuth = AUTH_ERROR_RE.test(msg);
+
+            if ((isTransient || isAuth) && attempt < MAX_RETRIES) {
+                console.warn(`[retry] Attempt ${attempt} failed (${msg}), retrying in ${RETRY_DELAY_MS}ms...`);
+
+                // Force token refresh on auth errors
+                if (isAuth) {
+                    MicrosoftAppCredentials.trustServiceUrl(context.activity.serviceUrl);
+                    adapter.credentials?.signRequest?.(null); // clear cached token
+                }
+
+                await sleep(RETRY_DELAY_MS * attempt);
+                continue;
+            }
+            throw err; // final attempt or non-retryable error
+        }
+    }
+}
 
 async function sendProactiveMessage(conversationReference, messageText) {
     await adapter.continueConversation(conversationReference, async (proactiveContext) => {
@@ -37,21 +72,32 @@ adapter.onTurnError = async (context, error) => {
     const errorMsg = error.message || 'Oops. Something went wrong!';
     console.error(`\n [onTurnError] unhandled error: ${ error }`);
 
-    // Clear out state
-    // await conversationState.delete(context);
-    // Send a trace activity, which will be displayed in Bot Framework Emulator
-    await context.sendTraceActivity(
-        'OnTurnError Trace',
-        `${ error }`,
-        'https://www.botframework.com/schemas/error',
-        'TurnError'
-    );
+    // Don't attempt to send messages back if the error is a connection reset
+    // or auth failure — those sends will also fail and cascade.
+    const isTransient = /ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(errorMsg);
+    const isAuthError = /authorization has been denied|401|unauthorized/i.test(errorMsg);
 
-    // Send a message to the user
-    await context.sendActivity(errorMsg);
+    if (isTransient) {
+        console.error('[onTurnError] Transient network error, skipping reply to user.');
+        return;
+    }
 
-    // Uncomment the line below for local debugging
-    await context.sendActivity(`Sorry, it looks like something went wrong. Exception Caught: ${ error }`);
+    if (isAuthError) {
+        console.error('[onTurnError] Authorization error — check MicrosoftAppId/MicrosoftAppPassword and bot registration.');
+        return;
+    }
+
+    try {
+        await context.sendTraceActivity(
+            'OnTurnError Trace',
+            `${ error }`,
+            'https://www.botframework.com/schemas/error',
+            'TurnError'
+        );
+        await context.sendActivity(`Sorry, it looks like something went wrong. Exception Caught: ${ errorMsg }`);
+    } catch (sendError) {
+        console.error(`[onTurnError] Failed to send error message to user: ${ sendError.message }`);
+    }
 };
 /*
 // Define the state store for your bot.
@@ -70,15 +116,10 @@ const dialog = new MainDialog();
 const botActivityHandler = new BotActivityHandler();
 const botHandler = (req, res) => {
     adapter.processActivity(req, res, async (context) => {
-        // Process bot activity
-        await botActivityHandler.run(context);
+        await runWithRetry(context, async (ctx) => {
+            await botActivityHandler.run(ctx);
+        });
     });
-    // Route received a request to adapter for processing
-    /*
-    adapter.process(req, res, (context) => {
-        // Process bot activity
-        botActivityHandler.run(context);
-    }); */
 };
 
 module.exports = botHandler;
