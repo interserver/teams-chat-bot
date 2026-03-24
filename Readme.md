@@ -184,3 +184,32 @@ To learn more about deploying a bot to Azure, see [Deploy your bot to Azure](htt
 
 
 <img src="https://pnptelemetry.azurewebsites.net/microsoft-teams-samples/samples/bot-receive-channel-messages-withRSC-nodejs" />
+
+https://www.npmjs.com/package/botbuilder#installing
+https://github.com/microsoft/BotBuilder-Samples/tree/main/experimental/generation
+https://github.com/microsoft/BotBuilder-Samples/tree/main/samples/javascript_nodejs/44.prompt-for-user-input
+https://github.com/microsoft/BotBuilder-Samples/tree/main/samples/javascript_nodejs/19.custom-dialogs
+https://github.com/microsoft/BotBuilder-Samples/tree/main/samples/javascript_nodejs/17.multilingual-bot
+https://github.com/microsoft/BotBuilder-Samples/tree/main/samples/javascript_nodejs/05.multi-turn-prompt
+https://github.com/microsoft/BotBuilder-Samples/tree/main/samples/javascript_nodejs/06.using-cards
+https://github.com/microsoft/BotBuilder-Samples/tree/main/samples/javascript_nodejs/07.using-adaptive-cards
+https://github.com/microsoft/BotBuilder-Samples/tree/main/samples/javascript_nodejs/15.handling-attachments
+https://github.com/microsoft/BotBuilder-Samples/tree/main/samples/javascript_nodejs/43.complex-dialog
+https://learn.microsoft.com/en-us/azure/bot-service/bot-service-overview?view=azure-bot-service-4.0
+https://learn.microsoft.com/en-us/javascript/api/botbuilder/?view=botbuilder-ts-latest
+https://www.npmjs.com/package/botbuilder-dialogs#learn-more
+https://learn.microsoft.com/en-us/azure/bot-service/bot-service-overview?view=azure-bot-service-4.0
+https://learn.microsoft.com/en-us/javascript/api/botbuilder-dialogs/?view=botbuilder-ts-latest
+https://github.com/Microsoft/botframework-sdk?tab=readme-ov-file
+https://github.com/Microsoft/botbuilder-js
+https://github.com/howdyai/botkit#readme
+https://github.com/howdyai/botkit/tree/main/packages/botbuilder-adapter-slack#readme
+https://github.com/BotBuilderCommunity/botbuilder-community-js/blob/master/libraries/botbuilder-adapter-console/README.md
+https://github.com/BotBuilderCommunity/botbuilder-community-js/blob/master/libraries/botbuilder-adapter-alexa/README.md
+https://github.com/BotBuilderCommunity/botbuilder-community-js/tree/master/samples/adapter-alexa
+https://github.com/BotBuilderCommunity/botbuilder-community-js/blob/master/libraries/botbuilder-dialog-prompts/README.md
+https://github.com/microsoft/Recognizers-Text
+https://github.com/BotBuilderCommunity/botbuilder-community-js/tree/master/samples/dialog-prompts
+https://github.com/BotBuilderCommunity/botbuilder-community-js/blob/master/libraries/botbuilder-storage-mongodb/README.md
+https://github.com/howdyai/botkit/blob/main/packages/docs/index.md
+https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication?view=azure-bot-service-4.0&tabs=multitenant
