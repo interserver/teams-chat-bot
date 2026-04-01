@@ -1,15 +1,13 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-const { TurnContext, TeamsInfo, TeamsActivityHandler, CardFactory, MessageFactory } = require('botbuilder');
+const { TurnContext, TeamsInfo, TeamsActivityHandler, MessageFactory } = require('botbuilder');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
-const fs = require('fs');
-const path = require('path');
 const Redis = require('ioredis');
 const { MongoClient } = require('mongodb');
 const mysql = require('mysql2/promise');
-const axios = require("axios");
+const { dispatch } = require('../commands');
 
 /*
 notifications 19:028421460efc48f89e00d1c7217bad63@thread.v2
@@ -36,420 +34,77 @@ class BotActivityHandler extends TeamsActivityHandler {
         });
         this.db.getConnection()
             .then((conn) => {
-                console.log("✅ Connected to MySQL");
+                console.log('✅ Connected to MySQL');
                 conn.release();
             })
-            .catch((err) => console.error("❌ MySQL error:", err));
+            .catch((err) => console.error('❌ MySQL error:', err));
 
         // Redis
-        this.redis = new Redis({ host: 'dragonfly.mailbaby.net', port: 6379 });
-        this.redis.on('connect', () => console.log("✅ Connected to Redis"));
-        this.redis.on('error', (err) => console.error("❌ Redis error:", err));
+        this.redis = new Redis({ host: process.env.REDIS_HOST || 'dragonfly.mailbaby.net', port: parseInt(process.env.REDIS_PORT || '6379', 10) });
+        this.redis.on('connect', () => console.log('✅ Connected to Redis'));
+        this.redis.on('error', (err) => console.error('❌ Redis error:', err));
 
         // MongoDB
         const mongoClient = new MongoClient(`mongodb://${ encodeURIComponent(process.env.ZONEMTA_USERNAME) }:${ encodeURIComponent(process.env.ZONEMTA_PASSWORD) }@${ process.env.ZONEMTA_HOST }:27017/`);
         mongoClient.connect()
-            .then(() => console.log("✅ Connected to MongoDB"))
-            .catch((err) => console.error("❌ MongoDB error:", err));
-        const usersCollection = mongoClient.db('zone-mta').collection('users');
+            .then(() => console.log('✅ Connected to MongoDB'))
+            .catch((err) => console.error('❌ MongoDB error:', err));
+        this.usersCollection = mongoClient.db('zone-mta').collection('users');
 
-        const execFileAsync = promisify(execFile);
+        this.execFileAsync = promisify(execFile);
 
         // Predefine regex
         this.hostRegex = /(?<host>([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,})/;
         this.emailRegex = /(?<email>[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
 
-        this.masterTables = {backup_masters: 'backup', website_masters: 'website', vps_masters: 'vps', qs_masters: 'qs'};
-        this.tableFields = {backup_masters: [], website_masters: [], vps_masters: [], qs_masters: []};
+        this.masterTables = { backup_masters: 'backup', website_masters: 'website', vps_masters: 'vps', qs_masters: 'qs' };
+        this.tableFields = { backup_masters: [], website_masters: [], vps_masters: [], qs_masters: [] };
         this.detailTables = ['vps_masters', 'qs_masters'];
-        for (let table in this.masterTables) {
-            let prefix = this.masterTables[table];
-            this.db.query(`DESCRIBE ??`, [table])  // use ?? for identifiers instead of ?
-            .then(([rows]) => {
-                if (rows && rows.length > 0) {
-                    rows.forEach(row => {
-                        let field = row.Field.replace(prefix + '_', '');
-                        this.tableFields[table].push(field);
-                    });
-                }
-            }).catch(err => {
-                console.error(`Error describing table ${table}:`, err);
-            });
+        for (const table in this.masterTables) {
+            const prefix = this.masterTables[table];
+            this.db.query('DESCRIBE ??', [table])
+                .then(([rows]) => {
+                    if (rows && rows.length > 0) {
+                        rows.forEach(row => {
+                            const field = row.Field.replace(prefix + '_', '');
+                            this.tableFields[table].push(field);
+                        });
+                    }
+                }).catch(err => {
+                    console.error(`Error describing table ${ table }:`, err);
+                });
         }
 
         // Activity called when there's a message in channel
         this.onMessage(async (context, next) => {
-            // conversationReference includes serviceUrl, user, bot, and conversation.id
             const conversationReference = TurnContext.getConversationReference(context.activity);
-            //console.log(conversationReference);
-            // store it somewhere (Redis, Mongo, MySQL, etc.)
-            await this.redis.set(`convref:${conversationReference.conversation.id}`, JSON.stringify(conversationReference));
+            await this.redis.set(`convref:${ conversationReference.conversation.id }`, JSON.stringify(conversationReference));
             const text = (context.activity.text || '').trim();
             const lcText = text.toLowerCase();
             const userId = context.activity.from.id;
-            /* member:
-            {
-              id: '29:1Tg_ijIGbNJjZZpPViCdFXG7adkoazSTdXmr79tYDeQtivdqiCe4Q3DDbUdxCriDHjzDMfTG-xBWAY971Kr9aRA',
-              name: 'Joe Huss',
-              aadObjectId: 'c64d7672-0cd2-4d0d-9a9f-7bac202f49b4',
-              givenName: 'Joe',
-              surname: 'Huss',
-              email: 'detain@interserver.net',
-              userPrincipalName: 'detain@interserver.net',
-              tenantId: '7837f8c1-952c-4ce2-8d54-6ef28f5cdfef',
-              userRole: 'user'
-            }
-            */
-            //const teamDetails = await TeamsInfo.getTeamDetails(context);
-/*            if (teamDetails) {
-                // Sends a message activity to the sender of the incoming activity.
-                await context.sendActivity(MessageFactory.text(`The group ID is: ${teamDetails.aadGroupId}`));
-            } else {
-                await context.sendActivity(MessageFactory.text('This message did not come from a channel in a team.'));
-            } */
-            //const teamChannels = await TeamsInfo.getTeamChannels(context);
-            //const members = await TeamsInfo.getMembers(context);
-            //console.log(members);
-            //console.log(teamDetails);
-            //console.log(teamChannels);
+
             const member = await TeamsInfo.getMember(context, userId);
             const email = member.email || member.userPrincipalName;
-            //const teamId = await TeamsInfo.getTeamId(context);
-            //console.log(`team id ${teamId}`);
-            // console.log('User email:', email);
-            // console.log('Conversation:', context.activity.conversation);
-            //console.log('Activity:');
             const channelId = context.activity.channelData.tenant.id;
-            //console.log(context);
-            //console.log(context.activity);
-            // console.log('Member:');
-            //console.log(member);
             const [accountRow] = await this.db.query('select * from accounts where account_lid=?', [email]);
             const ima = !accountRow || accountRow.length === 0 ? 'unknown' : accountRow[0].account_ima;
-            console.log(`#${channelId} [${ima}] ${member.name} <${email}> sent message: ${text}`);
-            let match;
-            if (text === 'ima') {
-                await context.sendActivity(MessageFactory.text(`Hello ${ member.name }, I see your email is ${ email } and you are ima ${ ima }`));
-            } else if ((match = text.match(/^ping\s+(.+)$/i))) {
-                const target = match[1].trim();
+            console.log(`#${ channelId } [${ ima }] ${ member.name } <${ email }> sent message: ${ text }`);
 
-                if (this.isValidHostname(target) || this.isValidIP(target)) {
-                    await context.sendActivity(MessageFactory.text(`Pinging \`${ target }\` ...`));
-                    try {
-                        // Run ping safely and await result
-                        const args = ['-w', '10', '-W', '10', '-c', '4', '-q', target];
-                        const { stdout } = await execFileAsync('ping', args, { timeout: 15000 });
-
-                        // Only keep last 3 lines
-                        const lines = stdout.trim().split('\n');
-                        const output = lines.slice(-3).join('\n');
-                        await context.sendActivity(MessageFactory.text('```\n' + output + '\n```'));
-                    } catch (err) {
-                        await context.sendActivity(MessageFactory.text(`⚠️ Error: ${ err.stderr || err.message }`));
-                    }
-                } else {
-                    await context.sendActivity(MessageFactory.text(`❌ Invalid hostname or IP: \`${ target }\``));
-                }
-            } else if (lcText === 'joke' || lcText === 'tell a joke') {
-                try {
-                    const jokesPath = path.join(__dirname, '../../jokes.json');
-                    const jokes = JSON.parse(fs.readFileSync(jokesPath, 'utf8'));
-                    const jokeList = Object.values(jokes).flat();
-                    if (Array.isArray(jokeList) && jokeList.length > 0) {
-                        const randomJoke = jokeList[Math.floor(Math.random() * jokeList.length)];
-                        if (Array.isArray(randomJoke)) {
-                            // Send each line separately
-                            for (const line of randomJoke) {
-                                await context.sendActivity(MessageFactory.text(line));
-                            }
-                        } else {
-                            // Fallback if joke isn’t an array
-                            await context.sendActivity(MessageFactory.text(String(randomJoke)));
-                        }
-                    } else {
-                        await context.sendActivity(MessageFactory.text('Hmm, I don’t have any jokes right now 😅'));
-                    }
-                } catch (err) {
-                    console.error('Error loading jokes.json:', err);
-                    await context.sendActivity(MessageFactory.text('⚠️ Sorry, I couldn’t fetch a joke right now.'));
-                }
-            } else if (ima === 'admin') {
-                if ((match = lcText.match(/^(mark|set) (\S+) (1|0|unavailable|available|enabled|disabled|disable|enable|off|on|usable|unusable)$/i))) {
-                    const server = match[2];
-                    const value = match[3].toLowerCase();
-                    const valuesOn = ['1', 'available', 'enabled', 'enable', 'on', 'usable'];
-                    const valuesOff = ['0', 'unavailable', 'disabled', 'disable', 'off', 'unusable'];
-                    if (valuesOn.includes(value)) {
-                        await this.setMaster(context, server, 'available', '1');
-                    } else if (valuesOff.includes(value)) {
-                        await this.setMaster(context, server, 'available', '0');
-                    } else {
-                        console.log(`Value ${value} not recognized`);
-                    }
-                } else if ((match = lcText.match(/^(mark|set) (\S+) (\S+)( | *= *| *to *)(\S+)$/i))) {
-                    const server = match[2];
-                    const field = match[3];
-                    const value = match[5];
-                    await this.setMaster(context, server, field, value);
-                } else if ((match = lcText.match(/^(mark|set) (\S+) on (\S+)( | *= *| *to *)(\S+)$/i))) {
-                    const field = match[2];
-                    const server = match[3];
-                    const value = match[5];
-                    await this.setMaster(context, server, field, value);
-                } else if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketCancel") {
-                    console.log(context.activity.value);
-                    await context.updateActivity({
-                        type: 'message',
-                        id: context.activity.value.activityId,
-                        conversation: context.activity.conversation,
-                        text: 'Add ticket canceled'
-                    });
-                } else if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketSubmit") {
-                    console.log(context.activity.value);
-                    try {
-                        const subject = context.activity.value.subject;
-                        const body = context.activity.value.contents;
-                        const dept = context.activity.value.department;
-                        const priority = context.activity.value.priority;
-                        const status = context.activity.value.status;
-                        const type = context.activity.value.type;
-                        const name = member.name;
-                        let params = {subject, body, dept, email, name, priority, status, type};
-                        // only add notes if it’s defined and not empty
-                        if (context.activity.value.notes) {
-                            params.notes = context.activity.value.notes;
-                        }
-                        const response = await axios.post("https://mystage.interserver.net/admin/ajax/create_ticket.php",
-                            new URLSearchParams(params),
-                            {headers: {"Content-Type": "application/x-www-form-urlencoded"}});
-                        if (response.status === 200) {
-                            //await context.sendActivity(MessageFactory.text(response.data));
-                            await context.updateActivity({
-                                type: 'message',
-                                id: context.activity.value.activityId,
-                                conversation: context.activity.conversation,
-                                text: response.data
-                            });
-                            console.log("✅ Success:", response.data);
-                        } else {
-                            await context.sendActivity(MessageFactory.text(response.data));
-                            console.log(`⚠️ Unexpected status ${response.status}:`, response.data);
-                        }
-                    } catch (error) {
-                        if (error.response) {
-                            await context.sendActivity(MessageFactory.text(error.response.data));
-                            console.log(`❌ Error ${error.response.status}:`, error.response.data);
-                        } else {
-                            await context.sendActivity(MessageFactory.text(error.message));
-                            console.log("❌ Request failed:", error.message);
-                        }
-                    }
-                }
-                if (lcText === 'add ticket') {
-                    const cardPath = path.join(__dirname, '../../cards/add_ticket.json');
-                    let cardContents = JSON.parse(fs.readFileSync(cardPath, 'utf8'));
-                    // Send the card first to get the activityId
-                    const sentActivity = await context.sendActivity({
-                        attachments: [CardFactory.adaptiveCard(cardContents)]
-                    });
-                    // Call it on the root card
-                    cardContents.body.forEach(element => this.updateActionSubmitData(element, sentActivity));
-                    // Replace the card message with the new card including activityId
-                    await context.updateActivity({
-                        type: 'message',
-                        id: sentActivity.id,
-                        conversation: context.activity.conversation,
-                        attachments: [CardFactory.adaptiveCard(cardContents)]
-                    });
-                } else if ((match = lcText.match(/^add (bugs|hardware|new unassigned|general|int-1|migrations|level 2|billing|windows|host department|escalation|sales|security|new features) ticket (.*)$/msi))) {
-                    const dept = match[1];
-                    const name = member.name;
-                    const msg = match[2];
-                    // Trim, split into lines
-                    let lines = msg.trim().split(/\r?\n/);
-                    let subject, body;
-                    if (lines.length === 1) {
-                      subject = body = lines[0];
-                    } else {
-                      subject = lines[0];
-                      body = lines.slice(1).join("\n");
-                    }
-                    console.log("Subject:", subject);
-                    console.log("Message:", body);
-                    try {
-                        const response = await axios.post("https://mystage.interserver.net/admin/ajax/create_ticket.php",
-                            new URLSearchParams({subject,body,dept,email,name}),
-                            {headers: {"Content-Type": "application/x-www-form-urlencoded"}});
-                        if (response.status === 200) {
-                            await context.sendActivity(MessageFactory.text(response.data));
-                            console.log("✅ Success:", response.data);
-                        } else {
-                            await context.sendActivity(MessageFactory.text(response.data));
-                            console.log(`⚠️ Unexpected status ${response.status}:`, response.data);
-                        }
-                    } catch (error) {
-                        if (error.response) {
-                            await context.sendActivity(MessageFactory.text(error.response.data));
-                            console.log(`❌ Error ${error.response.status}:`, error.response.data);
-                        } else {
-                            await context.sendActivity(MessageFactory.text(error.message));
-                            console.log("❌ Request failed:", error.message);
-                        }
-                    }
-
-
-                } else if ((match = lcText.match(/^add mailbaby user (\S+) (\S+)$/i))) {
-                    const user = match[1];
-                    const pass = match[2];
-                    const existing = await usersCollection.findOne({ username: user });
-                    if (existing) {
-                        await context.sendActivity(MessageFactory.text(`Found existing user '${ user }'`));
-                    } else {
-                        const result = await usersCollection.insertOne({ username: user, password: pass });
-                        if (result.insertedId) {
-                            await context.sendActivity(MessageFactory.text(`Added user '${ user }' with password '${ pass }'`));
-                        } else {
-                            await context.sendActivity(MessageFactory.text(`Error adding user '${ user }' with password '${ pass }'`));
-                        }
-                    }
-                } else if ((match = text.match(/^delete mailbaby user (\S+)$/i))) {
-                    const user = match[1];
-                    const existing = await usersCollection.findOne({ username: user });
-                    if (existing) {
-                        await usersCollection.deleteOne({ username: user });
-                        await context.sendActivity(MessageFactory.text(`Removed user '${ user }'`));
-                    } else {
-                        await context.sendActivity(MessageFactory.text(`No user '${ user }' exists`));
-                    }
-                } else if ((match = text.match(/.*(where|lookup|query|find|locate|search).*?[^\d](\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[^\d]?.*/i))) {
-                    const ip = match[2];
-                    const [rows] = await this.db.query(
-                        `SELECT *, assets.id AS real_asset_id
-                        FROM ips
-                        LEFT JOIN vlans ON ips_vlan=vlans_id
-                        LEFT JOIN switchports ON FIND_IN_SET(ips_vlan, vlans) != 0
-                        LEFT JOIN assets ON switchports.asset_id=assets.id
-                        LEFT JOIN asset_types ON type_id=asset_types.asset_id
-                        LEFT JOIN asset_locations ON location_id=datacenter
-                        LEFT JOIN asset_racks ON rack_id=rack
-                        LEFT JOIN switchmanager ON switchports.switch=switchmanager.id
-                        WHERE ips_ip = ?`,
-                        [ip]
-                    );
-
-                    if (!rows || rows.length === 0) {
-                        await context.sendActivity(MessageFactory.text(`Unable to find ${ ip } in our IP database`));
-                    } else {
-                        const r = rows[0];
-                        const unit = r.unit_start !== r.unit_end ? `${ r.unit_start }-${ r.unit_end }` : r.unit_start;
-
-                        await context.sendActivity(`Asset: ${ r.real_asset_id }\n
-    Hostname: ${ r.hostname }\n
-    Status: ${ r.status }\n
-    Rack: ${ r.location_name } ${ r.rack_name }\n
-    Unit: ${ unit }\n
-    Network: Switch${ r.name } Port ${ r.port }\n
-    https://my.interserver.net/admin/view_server_order?id=${ r.order_id }\n
-    https://my.interserver.net/admin/asset_form?id=${ r.real_asset_id }`
-                        );
-                    }
-                } else if (/^(blocks|block list|blocks list)$/i.test(lcText)) {
-                    const blockedEmails = await this.redis.smembers('blocked_emails');
-                    blockedEmails.sort();
-                    const text = `*Blocked Emails* (${ blockedEmails.length })\n` + blockedEmails.join(', ');
-                    await context.sendActivity(MessageFactory.text(text));
-                } else if (new RegExp(`^(block|block email) ${ this.emailRegex.source }$`, 'i').test(lcText)) {
-                    const match = lcText.match(new RegExp(this.emailRegex, 'i'));
-                    const email = match.groups.email;
-                    const added = await this.redis.sadd('blocked_emails', email);
-                    if (added) {
-                        await context.sendActivity(MessageFactory.text(`✅ Successfully added *${ email }* to blocked emails list.`));
-                    } else {
-                        await context.sendActivity(MessageFactory.text(`⚠️ *${ email }* already exists in blocked emails list.`));
-                    }
-                } else if (new RegExp(`^(block remove|block delete|block email remove|block email delete|blocked email remove|blocked email delete) ${ this.emailRegex.source }$`, 'i').test(lcText)) {
-                    const match = lcText.match(new RegExp(this.emailRegex, 'i'));
-                    const email = match.groups.email;
-                    const removed = await this.redis.srem('blocked_emails', email);
-                    if (removed) {
-                        await context.sendActivity(MessageFactory.text(`✅ Successfully removed *${ email }* from blocked emails list.`));
-                    } else {
-                        await context.sendActivity(MessageFactory.text(`⚠️ *${ email }* is not in blocked emails list.`));
-                    }
-                } else if (/^(blocked domains|blocked hosts|blocked domains list|blocked hosts list)$/i.test(lcText)) {
-                    const blockedDomains = await this.redis.smembers('blocked_domains');
-                    blockedDomains.sort();
-                    const text = `*Blocked Domains* (${ blockedDomains.length })\n` + blockedDomains.join(', ');
-                    await context.sendActivity(MessageFactory.text(text));
-                } else if (new RegExp(`^(block domain|block hostname|block host) ${ this.hostRegex.source }$`, 'i').test(lcText)) {
-                    const match = lcText.match(new RegExp(this.hostRegex, 'i'));
-                    const host = match.groups.host;
-                    const added = await this.redis.sadd('blocked_domains', host);
-                    if (added) {
-                        await context.sendActivity(MessageFactory.text(`✅ Successfully added *${ host }* to blocked domains list.`));
-                    } else {
-                        await context.sendActivity(MessageFactory.text(`⚠️ *${ host }* already exists in blocked domains list.`));
-                    }
-                } else if (new RegExp(`^(block remove domain|block delete domain|block domain remove|block domain delete|blocked domain remove|blocked domain delete|blocked domains remove|blocked domains delete) ${ this.hostRegex.source }$`, 'i').test(lcText)) {
-                    const match = lcText.match(new RegExp(this.hostRegex, 'i'));
-                    const host = match.groups.host;
-                    const removed = await this.redis.srem('blocked_domains', host);
-                    if (removed) {
-                        await context.sendActivity(MessageFactory.text(`✅ Successfully removed *${ host }* from blocked domains list.`));
-                    } else {
-                        await context.sendActivity(MessageFactory.text(`⚠️ *${ host }* is not in blocked domains list.`));
-                    }
-                } else if (/^blocks? help$/i.test(lcText)) {
-                    const commands = {
-                        'blocks list': { description: 'List all blocked Emails' },
-                        'block <email>': { description: 'Adds an email to the blocked emails list.' },
-                        'block remove <email>': { description: 'Removes an email address from the blocked emails list.' },
-                        'blocked domains': { description: 'List all blocked Domains' },
-                        'block domain <host>': { description: 'Adds a domain to the blocked domains list.' },
-                        'block domain remove <host>': { description: 'Removes a domain from the blocked domains list.' },
-                        'block help': { description: 'Show all available Blocked Email/Domains commands' }
-                    };
-                    let text = '*MailBaby Blocked Emails and Domains Help*\n';
-                    for (const [command, details] of Object.entries(commands)) {
-                        text += `\`${ command }\` - ${ details.description }\n`;
-                    }
-                    await context.sendActivity(MessageFactory.text(text));
-                }
-/* TODO:
-- Github Issues
-    'issues list' => ['params' => [], 'description' => 'List all open issues'],
-    'issues show <id>' => ['params' => ['id'], 'description' => 'Show details of a specific issue'],
-    'issues close <id> [comment]' => ['params' => ['id', 'comment'], 'description' => 'Close an issue with an optional comment'],
-    'issues comment <id> <comment>' => ['params' => ['id', 'comment'], 'description' => 'Add a comment to an issue'],
-    'issues create <title> [body]' => ['params' => ['title', 'body'], 'description' => 'Create a new issue'],
-    'labels list' => ['params' => [], 'description' => 'List all labels'],
-    'label create <name> <color> [description]' => ['params' => ['name', 'color', 'description'], 'description' => 'Create a new label'],
-    'label update <name> <new_name> <color> [description]' => ['params' => ['name', 'new_name', 'color', 'description'], 'description' => 'Update an existing label'],
-    'label add <issue_id> <label>' => ['params' => ['issue_id', 'label'], 'description' => 'Add a label to an issue'],
-    'label remove <issue_id> <label>' => ['params' => ['issue_id', 'label'], 'description' => 'Remove a label from an issue'],
-    'github help' => ['params' => [], 'description' => 'Show all available GitHub commands']
-- Datacenterd Related
-    get global <var>
-    set global <var>\
-    hyperv status
-    processing status
-*/
-            }
+            // Dispatch to command registry
+            const deps = {
+                context,
+                member,
+                email,
+                ima,
+                db: this.db,
+                redis: this.redis,
+                usersCollection: this.usersCollection,
+                execFileAsync: this.execFileAsync,
+                bot: this
+            };
+            await dispatch(text, lcText, deps);
             await next();
         });
-
-/*)        // called when card action is taken
-        // Correct way to handle Adaptive Card submit actions in Teams
-        this.onInvokeActivity(async (context, next) => {
-            console.log('got onTeamsCardActionInvoke event');
-            console.log(context.activity);
-            if (context.activity.value && context.activity.value.msteams && context.activity.value.msteams.type === "addTicketSubmit") {
-                await context.sendActivity(MessageFactory.text("Ticket submission received! 🎟️"));
-                await context.sendActivity("Ticket submission received! 🎟️");
-            }
-            await next();
-        });
-*/
 
         // Called when the bot is added to a team.
         this.onMembersAdded(async (context, next) => {
@@ -459,142 +114,106 @@ class BotActivityHandler extends TeamsActivityHandler {
         });
 
         this.onCommand(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onCommand event'));
             console.log('got onCommand event');
             console.log(context.activity);
             await next();
         });
 
         this.onCommandResult(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onCommandResult event'));
             console.log('got onCommandResult event');
             console.log(context.activity);
             await next();
         });
 
         this.onConversationUpdate(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onConversationUpdate event'));
             console.log('got onConversationUpdate event');
             console.log(context.activity);
             await next();
         });
 
-        /*this.onDialog(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onDialog event'));
-            console.log('got onDialog event');
-            console.log(context.activity);
-            await next();
-        });*/
-
         this.onEndOfConversation(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onEndOfConversation event'));
             console.log('got onEndOfConversation event');
             console.log(context.activity);
             await next();
         });
 
         this.onEvent(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onEvent event'));
             console.log('got onEvent event');
             console.log(context.activity);
             await next();
         });
 
         this.onInstallationUpdateAdd(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onInstallationUpdateAdd event'));
             console.log('got onInstallationUpdateAdd event');
             console.log(context.activity);
             await next();
         });
 
         this.onInstallationUpdate(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onInstallationUpdate event'));
             console.log('got onInstallationUpdate event');
             console.log(context.activity);
             await next();
         });
 
         this.onInstallationUpdateRemove(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onInstallationUpdateRemove event'));
             console.log('got onInstallationUpdateRemove event');
             console.log(context.activity);
             await next();
         });
 
         this.onMembersRemoved(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onMembersRemoved event'));
             console.log('got onMembersRemoved event');
             console.log(context.activity);
             await next();
         });
 
         this.onMessageDelete(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onMessageDelete event'));
             console.log('got onMessageDelete event');
             console.log(context.activity);
             await next();
         });
 
         this.onMessageReaction(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onMessageReaction event'));
             console.log('got onMessageReaction event');
             console.log(context.activity);
             await next();
         });
 
         this.onMessageUpdate(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onMessageUpdate event'));
             console.log('got onMessageUpdate event');
             console.log(context.activity);
             await next();
         });
 
         this.onReactionsAdded(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onReactionsAdded event'));
             console.log('got onReactionsAdded event');
             console.log(context.activity);
             await next();
         });
 
         this.onReactionsRemoved(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onReactionsRemoved event'));
             console.log('got onReactionsRemoved event');
             console.log(context.activity);
             await next();
         });
 
         this.onTokenResponseEvent(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onTokenResponseEvent event'));
             console.log('got onTokenResponseEvent event');
             console.log(context.activity);
             await next();
         });
 
-        /*
-        this.onTurn(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onTurn event'));
-            console.log('got onTurn event');
-            //console.log(context.activity);
-            console.log(context.activity.channelData);
-            await next();
-        });
-        */
-
         this.onTyping(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onTyping event'));
             console.log('got onTyping event');
             console.log(context.activity);
             await next();
         });
 
         this.onUnrecognizedActivityType(async (context, next) => {
-            //await context.sendActivity(MessageFactory.text('Got onUnrecognizedActivityType event'));
             console.log('got onUnrecognizedActivityType event');
             console.log(context.activity);
             await next();
         });
-
-
     }
 
     // Validate IPv4 + IPv6
@@ -611,14 +230,13 @@ class BotActivityHandler extends TeamsActivityHandler {
     }
 
     updateActionSubmitData(element, sentActivity) {
-        if (element.type === "ActionSet" && Array.isArray(element.actions)) {
+        if (element.type === 'ActionSet' && Array.isArray(element.actions)) {
             element.actions.forEach(action => {
-                if (action.type === "Action.Submit") {
+                if (action.type === 'Action.Submit') {
                     action.data.activityId = sentActivity.id;
                 }
             });
         }
-        // Recurse into known containers
         if (Array.isArray(element.items)) {
             element.items.forEach(item => this.updateActionSubmitData(item, sentActivity));
         }
@@ -631,38 +249,55 @@ class BotActivityHandler extends TeamsActivityHandler {
     }
 
     async setMaster(context, server, field, value) {
+        const { MessageFactory } = require('botbuilder');
+        // Input sanitization: restrict server names and field/value length
+        const SAFE_NAME = /^[a-zA-Z0-9._-]{1,128}$/;
+        const MAX_VALUE_LEN = 256;
+        if (!SAFE_NAME.test(server)) {
+            await context.sendActivity(MessageFactory.text(`Invalid server name: \`${ server }\``));
+            return;
+        }
+        if (!SAFE_NAME.test(field)) {
+            await context.sendActivity(MessageFactory.text(`Invalid field name: \`${ field }\``));
+            return;
+        }
+        if (String(value).length > MAX_VALUE_LEN) {
+            await context.sendActivity(MessageFactory.text('Value is too long'));
+            return;
+        }
+
         let found = false;
-        for (let table in this.masterTables) {
+        for (const table in this.masterTables) {
             const prefix = this.masterTables[table];
-            const nameField = prefix + "_name";
+            const nameField = prefix + '_name';
             try {
-                const [rows] = await this.db.query(`SELECT * FROM ?? WHERE ?? = ? LIMIT 1`, [table, nameField, server]);
+                const [rows] = await this.db.query('SELECT * FROM ?? WHERE ?? = ? LIMIT 1', [table, nameField, server]);
                 if (rows && rows.length > 0) {
                     server = rows[0][nameField];
                     if (this.tableFields[table].includes(field)) {
-                        if (rows[0][prefix+"_available"] == value) {
-                            await context.sendActivity(MessageFactory.text(`${server} in ${table} is already marked available=${value}`));
-                            console.log(`${server} in ${table} is already marked available=${value}`);
+                        if (String(rows[0][prefix + '_available']) === String(value)) {
+                            await context.sendActivity(MessageFactory.text(`${ server } in ${ table } is already marked available=${ value }`));
+                            console.log(`${ server } in ${ table } is already marked available=${ value }`);
                         } else {
-                            await this.db.query(`UPDATE ?? SET ?? = ? WHERE ?? = ?`,[table, prefix+"_"+field, value, nameField, server]);
-                            await context.sendActivity(MessageFactory.text(`Updated ${field}=${value} in ${table} where ${nameField} = ${server}`));
-                            console.log(`Updated ${field}=${value} in ${table} where ${nameField} = ${server}`);
+                            await this.db.query('UPDATE ?? SET ?? = ? WHERE ?? = ?', [table, prefix + '_' + field, value, nameField, server]);
+                            await context.sendActivity(MessageFactory.text(`Updated ${ field }=${ value } in ${ table } where ${ nameField } = ${ server }`));
+                            console.log(`Updated ${ field }=${ value } in ${ table } where ${ nameField } = ${ server }`);
                         }
                     } else {
-                        await context.sendActivity(MessageFactory.text(`field ${field} does not exist for ${server} in ${table}`));
-                        console.log(`field ${field} does not exist for ${server} in ${table}`);
+                        await context.sendActivity(MessageFactory.text(`field ${ field } does not exist for ${ server } in ${ table }`));
+                        console.log(`field ${ field } does not exist for ${ server } in ${ table }`);
                     }
                     found = true;
-                    break; // stop after first match
+                    break;
                 }
             } catch (err) {
-                await context.sendActivity(MessageFactory.text(`Error querying table ${table}:`, err));
-                console.error(`Error querying table ${table}:`, err);
+                await context.sendActivity(MessageFactory.text(`Error querying table ${ table }:`, err));
+                console.error(`Error querying table ${ table }:`, err);
             }
         }
         if (!found) {
-            await context.sendActivity(MessageFactory.text(`No matching server "${server}" found in any master table`));
-            console.log(`No matching server "${server}" found in any master table`);
+            await context.sendActivity(MessageFactory.text(`No matching server "${ server }" found in any master table`));
+            console.log(`No matching server "${ server }" found in any master table`);
         }
     }
 }
