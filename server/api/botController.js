@@ -30,7 +30,7 @@ async function runWithRetry(context, handler) {
             const isAuth = AUTH_ERROR_RE.test(msg);
 
             if ((isTransient || isAuth) && attempt < MAX_RETRIES) {
-                console.warn(`[retry] Attempt ${attempt} failed (${msg}), retrying in ${RETRY_DELAY_MS}ms...`);
+                console.warn(`[retry] Attempt ${ attempt } failed (${ msg }), retrying in ${ RETRY_DELAY_MS }ms...`);
 
                 // Force token refresh on auth errors
                 if (isAuth) {

@@ -47,7 +47,7 @@ async function sendProactiveMessage(conversationReference, messageText) {
             const isAuth = AUTH_ERROR_RE.test(msg);
 
             if ((isTransient || isAuth) && attempt < MAX_RETRIES) {
-                console.warn(`[proactive retry] Attempt ${attempt} failed (${msg}), retrying in ${RETRY_DELAY_MS}ms...`);
+                console.warn(`[proactive retry] Attempt ${ attempt } failed (${ msg }), retrying in ${ RETRY_DELAY_MS }ms...`);
 
                 if (isAuth) {
                     MicrosoftAppCredentials.trustServiceUrl(conversationReference.serviceUrl);
@@ -92,8 +92,8 @@ adapter.onTurnError = async (context, error) => {
     }
 };
 const redis = new Redis({ host: 'dragonfly.mailbaby.net', port: 6379 });
-redis.on('connect', () => console.log("✅ Connected to Redis"));
-redis.on('error', (err) => console.error("❌ Redis error:", err));
+redis.on('connect', () => console.log('✅ Connected to Redis'));
+redis.on('error', (err) => console.error('❌ Redis error:', err));
 
 /*
 // Define the state store for your bot.
@@ -113,13 +113,13 @@ const msgHandler = async (req, res) => {
     const targetConversationId = '19:0c93975aae904b7db892891da3065c33@thread.v2';
     try {
         // retrieve stored reference
-        const stored = await redis.get(`convref:${targetConversationId}`);
+        const stored = await redis.get(`convref:${ targetConversationId }`);
         if (stored) {
             const conversationReference = JSON.parse(stored);
             await sendProactiveMessage(conversationReference, req.body.message);
-            res.json({ message: "sent" });
+            res.json({ message: 'sent' });
         } else {
-            res.status(404).json({ message: "no conversation reference found" });
+            res.status(404).json({ message: 'no conversation reference found' });
         }
     } catch (err) {
         console.error('[msgHandler] Error sending proactive message:', err.message);
