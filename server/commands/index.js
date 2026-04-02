@@ -14,7 +14,14 @@ const commands = [
     require('./ipLookup'),
     require('./blockEmail'),
     require('./blockDomain'),
-    require('./blockHelp')
+    require('./blockHelp'),
+    require('./githubIssues'),
+    require('./githubLabels'),
+    require('./assetSearch'),
+    require('./hypervStatus'),
+    require('./processingStatus'),
+    require('./globalVar'),
+    require('./help')
 ];
 
 /**

@@ -15,6 +15,13 @@ const ipLookup = require('../server/commands/ipLookup');
 const blockEmail = require('../server/commands/blockEmail');
 const blockDomain = require('../server/commands/blockDomain');
 const blockHelp = require('../server/commands/blockHelp');
+const githubIssues = require('../server/commands/githubIssues');
+const githubLabels = require('../server/commands/githubLabels');
+const assetSearch = require('../server/commands/assetSearch');
+const hypervStatus = require('../server/commands/hypervStatus');
+const processingStatus = require('../server/commands/processingStatus');
+const globalVar = require('../server/commands/globalVar');
+const help = require('../server/commands/help');
 
 // ─── ima ────────────────────────────────────────────────────────────────────
 
@@ -218,5 +225,223 @@ describe('blockHelp command', () => {
     });
     it('does not match for non-admin', () => {
         assert.equal(blockHelp.match('block help', 'block help', { ima: 'user' }), null);
+    });
+});
+
+// ─── githubIssues ──────────────────────────────────────────────────────────
+
+describe('githubIssues command', () => {
+    const deps = { ima: 'admin' };
+    it('matches "issues list"', () => {
+        const m = githubIssues.match('issues list', 'issues list', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'list');
+    });
+    it('matches "issues"', () => {
+        const m = githubIssues.match('issues', 'issues', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'list');
+    });
+    it('matches "issues show 42"', () => {
+        const m = githubIssues.match('issues show 42', 'issues show 42', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'show');
+        assert.equal(m.id, 42);
+    });
+    it('matches "show issue 5"', () => {
+        const m = githubIssues.match('show issue 5', 'show issue 5', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'show');
+        assert.equal(m.id, 5);
+    });
+    it('matches "issue close 10 fixed it"', () => {
+        const m = githubIssues.match('issue close 10 fixed it', 'issue close 10 fixed it', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'close');
+        assert.equal(m.id, 10);
+        assert.equal(m.comment, 'fixed it');
+    });
+    it('matches "issues close 7" without comment', () => {
+        const m = githubIssues.match('issues close 7', 'issues close 7', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'close');
+        assert.equal(m.comment, '');
+    });
+    it('matches "issues comment 3 looks good"', () => {
+        const m = githubIssues.match('issues comment 3 looks good', 'issues comment 3 looks good', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'comment');
+        assert.equal(m.id, 3);
+        assert.equal(m.comment, 'looks good');
+    });
+    it('matches "issues create Fix the thing"', () => {
+        const m = githubIssues.match('issues create Fix the thing', 'issues create fix the thing', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'create');
+        assert.equal(m.raw, 'Fix the thing');
+    });
+    it('matches "github help"', () => {
+        const m = githubIssues.match('github help', 'github help', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'help');
+    });
+    it('matches "gh help"', () => {
+        const m = githubIssues.match('gh help', 'gh help', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'help');
+    });
+    it('does not match for non-admin', () => {
+        assert.equal(githubIssues.match('issues list', 'issues list', { ima: 'user' }), null);
+    });
+});
+
+// ─── githubLabels ──────────────────────────────────────────────────────────
+
+describe('githubLabels command', () => {
+    const deps = { ima: 'admin' };
+    it('matches "labels list"', () => {
+        const m = githubLabels.match('labels list', 'labels list', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'list');
+    });
+    it('matches "labels"', () => {
+        const m = githubLabels.match('labels', 'labels', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'list');
+    });
+    it('matches "label create bug ff0000"', () => {
+        const m = githubLabels.match('label create bug ff0000', 'label create bug ff0000', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'create');
+        assert.equal(m.name, 'bug');
+        assert.equal(m.color, 'ff0000');
+    });
+    it('matches "label create bug #00ff00 Description here"', () => {
+        const m = githubLabels.match('label create bug #00ff00 Description here', 'label create bug #00ff00 description here', deps);
+        assert.ok(m);
+        assert.equal(m.color, '00ff00');
+        assert.equal(m.description, 'Description here');
+    });
+    it('matches "label update bug fix 0000ff"', () => {
+        const m = githubLabels.match('label update bug fix 0000ff', 'label update bug fix 0000ff', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'update');
+        assert.equal(m.name, 'bug');
+        assert.equal(m.newName, 'fix');
+        assert.equal(m.color, '0000ff');
+    });
+    it('matches "label add 5 enhancement"', () => {
+        const m = githubLabels.match('label add 5 enhancement', 'label add 5 enhancement', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'add');
+        assert.equal(m.issueId, 5);
+        assert.equal(m.label, 'enhancement');
+    });
+    it('matches "label remove 3 bug"', () => {
+        const m = githubLabels.match('label remove 3 bug', 'label remove 3 bug', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'remove');
+        assert.equal(m.issueId, 3);
+        assert.equal(m.label, 'bug');
+    });
+    it('does not match for non-admin', () => {
+        assert.equal(githubLabels.match('labels list', 'labels list', { ima: 'user' }), null);
+    });
+});
+
+// ─── assetSearch ───────────────────────────────────────────────────────────
+
+describe('assetSearch command', () => {
+    const deps = { ima: 'admin' };
+    it('matches "search asset server1"', () => {
+        const m = assetSearch.match('search asset server1', 'search asset server1', deps);
+        assert.ok(m);
+        assert.equal(m.query, 'server1');
+    });
+    it('matches "find asset 123"', () => {
+        const m = assetSearch.match('find asset 123', 'find asset 123', deps);
+        assert.ok(m);
+        assert.equal(m.query, '123');
+    });
+    it('matches "lookup asset web-host.prod"', () => {
+        const m = assetSearch.match('lookup asset web-host.prod', 'lookup asset web-host.prod', deps);
+        assert.ok(m);
+        assert.equal(m.query, 'web-host.prod');
+    });
+    it('does not match for non-admin', () => {
+        assert.equal(assetSearch.match('search asset foo', 'search asset foo', { ima: 'user' }), null);
+    });
+    it('does not match without asset keyword', () => {
+        assert.equal(assetSearch.match('search server1', 'search server1', deps), null);
+    });
+});
+
+// ─── hypervStatus ──────────────────────────────────────────────────────────
+
+describe('hypervStatus command', () => {
+    it('matches "hyperv status"', () => {
+        assert.ok(hypervStatus.match('hyperv status', 'hyperv status', { ima: 'admin' }));
+    });
+    it('matches case-insensitively', () => {
+        assert.ok(hypervStatus.match('HyperV Status', 'hyperv status', { ima: 'admin' }));
+    });
+    it('does not match for non-admin', () => {
+        assert.equal(hypervStatus.match('hyperv status', 'hyperv status', { ima: 'user' }), null);
+    });
+    it('does not match partial text', () => {
+        assert.equal(hypervStatus.match('hyperv', 'hyperv', { ima: 'admin' }), null);
+    });
+});
+
+// ─── processingStatus ──────────────────────────────────────────────────────
+
+describe('processingStatus command', () => {
+    it('matches "processing status"', () => {
+        assert.ok(processingStatus.match('processing status', 'processing status', { ima: 'admin' }));
+    });
+    it('does not match for non-admin', () => {
+        assert.equal(processingStatus.match('processing status', 'processing status', { ima: 'user' }), null);
+    });
+    it('does not match partial text', () => {
+        assert.equal(processingStatus.match('processing', 'processing', { ima: 'admin' }), null);
+    });
+});
+
+// ─── globalVar ─────────────────────────────────────────────────────────────
+
+describe('globalVar command', () => {
+    const deps = { ima: 'admin' };
+    it('matches "get global myvar"', () => {
+        const m = globalVar.match('get global myvar', 'get global myvar', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'get');
+        assert.equal(m.varName, 'myvar');
+    });
+    it('matches "set global myvar hello world"', () => {
+        const m = globalVar.match('set global myvar hello world', 'set global myvar hello world', deps);
+        assert.ok(m);
+        assert.equal(m.action, 'set');
+        assert.equal(m.varName, 'myvar');
+        assert.equal(m.value, 'hello world');
+    });
+    it('does not match for non-admin', () => {
+        assert.equal(globalVar.match('get global foo', 'get global foo', { ima: 'user' }), null);
+    });
+    it('does not match bare "get global"', () => {
+        assert.equal(globalVar.match('get global', 'get global', deps), null);
+    });
+});
+
+// ─── help ──────────────────────────────────────────────────────────────────
+
+describe('help command', () => {
+    it('matches "help"', () => {
+        assert.ok(help.match('help', 'help'));
+    });
+    it('does not match "help me"', () => {
+        assert.equal(help.match('help me', 'help me'), null);
+    });
+    it('does not match "github help"', () => {
+        assert.equal(help.match('github help', 'github help'), null);
     });
 });
