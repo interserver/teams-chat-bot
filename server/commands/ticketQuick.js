@@ -6,7 +6,7 @@ const TICKET_URL = process.env.TICKET_API_URL || 'https://mystage.interserver.ne
 module.exports = {
     match(text, lcText, { ima }) {
         if (ima !== 'admin') return null;
-        const m = lcText.match(/^add (bugs|hardware|new unassigned|general|int-1|migrations|level 2|billing|windows|host department|escalation|sales|security|new features) ticket (.*)$/msi);
+        const m = lcText.match(/^add (hardware-modifications|developer escalation|win-migrations|win-escalations|new unassigned|host department|new features|mail baby|hdbilling|provisioning|migrations|level 2|hardware|billing|windows|escalation|security|general|int-1|support|legal|sales|abuse|bugs|hd) ticket (.*)$/msi);
         return m ? { dept: m[1], msg: m[2] } : null;
     },
     async execute({ dept, msg }, { context, member, email }) {
