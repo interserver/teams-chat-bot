@@ -12,5 +12,6 @@ router.use(express.urlencoded({ extended: true })); // for application/x-www-for
 // Route to handle incoming messages
 router.post('/messages', require('./botController'));
 router.post('/message', require('./msgController'));
+router.post('/dailyrecap', require('./dailyRecapController'));
 
 module.exports = router;

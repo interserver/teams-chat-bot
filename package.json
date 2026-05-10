@@ -20,6 +20,8 @@
   "dependencies": {
     "@microsoft/microsoft-graph-client": "~2.0.0",
     "@octokit/rest": "^22.0.1",
+    "adaptive-expressions": "^4.23.3",
+    "adaptivecards-templating": "^2.3.1",
     "axios": "^1.7.0",
     "body-parser": "^1.19.0",
     "botbuilder": "^4.23.2",

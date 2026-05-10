@@ -2,55 +2,10 @@
 // Licensed under the MIT License.
 
 const {
-/*    CloudAdapter,
-    ConversationState,
-    MemoryStorage,
-    UserState,
-    ConfigurationBotFrameworkAuthentication, */
     BotFrameworkAdapter
 } = require('botbuilder');
-const { MicrosoftAppCredentials } = require('botframework-connector');
 const { BotActivityHandler } = require('../bot/botActivityHandler');
-
-const TRANSIENT_RE = /ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i;
-const AUTH_ERROR_RE = /authorization has been denied|401|unauthorized/i;
-const MAX_RETRIES = 2;
-const RETRY_DELAY_MS = 1000;
-
-function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-
-async function runWithRetry(context, handler) {
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        try {
-            await handler(context);
-            return; // success
-        } catch (err) {
-            const msg = err.message || '';
-            const isTransient = TRANSIENT_RE.test(msg);
-            const isAuth = AUTH_ERROR_RE.test(msg);
-
-            if ((isTransient || isAuth) && attempt < MAX_RETRIES) {
-                console.warn(`[retry] Attempt ${ attempt } failed (${ msg }), retrying in ${ RETRY_DELAY_MS }ms...`);
-
-                // Force token refresh on auth errors
-                if (isAuth) {
-                    MicrosoftAppCredentials.trustServiceUrl(context.activity.serviceUrl);
-                    adapter.credentials?.signRequest?.(null); // clear cached token
-                }
-
-                await sleep(RETRY_DELAY_MS * attempt);
-                continue;
-            }
-            throw err; // final attempt or non-retryable error
-        }
-    }
-}
-
-async function sendProactiveMessage(conversationReference, messageText) {
-    await adapter.continueConversation(conversationReference, async (proactiveContext) => {
-        await proactiveContext.sendActivity(messageText);
-    });
-}
+const { runWithRetry } = require('../lib/retry');
 
 /*
 const { TeamsBot } = require('../bot/teamsBot');
@@ -116,10 +71,15 @@ const dialog = new MainDialog();
 const botActivityHandler = new BotActivityHandler();
 const botHandler = (req, res) => {
     adapter.processActivity(req, res, async (context) => {
-        await runWithRetry(context, async (ctx) => {
-            await botActivityHandler.run(ctx);
+        await runWithRetry(async () => {
+            await botActivityHandler.run(context);
+        }, {
+            label: 'botController',
+            serviceUrl: context.activity && context.activity.serviceUrl,
+            maxRetries: 3
         });
     });
 };
 
 module.exports = botHandler;
+module.exports.botActivityHandler = botActivityHandler;
