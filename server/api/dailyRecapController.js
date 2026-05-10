@@ -16,6 +16,9 @@
 //     "channel":  "int-dev"   // friendly name from CHANNELS map below
 //   }
 //
+// Headers:
+//   X-Daily-Recap-Token: <DAILY_RECAP_TOKEN>
+//
 // Response:
 //   200 { ok: true,  activityId, conversationId, channel, bytes_sent }
 //   4xx { ok: false, error }
@@ -26,9 +29,9 @@
 // must have observed at least one message in the target channel since
 // the bot was added.
 
-const { BotFrameworkAdapter } = require('botbuilder');
+const { getAdapter } = require('../lib/adapter');
+const { createBotRedis } = require('../lib/redis');
 const { Template } = require('adaptivecards-templating');
-const Redis = require('ioredis');
 const { runWithRetry } = require('../lib/retry');
 const { CHANNELS } = require('../queue/channels');
 
@@ -37,51 +40,56 @@ const RECAP_REDIS_TTL = 60 * 60 * 24 * 2; // 2 days — long enough for the chat
 // recap is meant as a transient digest; leaving it in the channel feed
 // is noise.  Five minutes gives admins enough time to read it.
 const AUTO_DELETE_MS = 5 * 60 * 1000;
+const MAX_CARD_BYTES = 25 * 1024; // Teams hard limit
 
-const adapter = new BotFrameworkAdapter({
-    appId: process.env.MicrosoftAppId,
-    appPassword: process.env.MicrosoftAppPassword
-});
+// Track pending auto-delete timers for debugging/monitoring
+const _pendingDeletes = new Map();
 
-adapter.onTurnError = async (context, error) => {
-    console.error(`[dailyrecap onTurnError] ${ error }`);
-};
+const redis = createBotRedis();
 
-const redis = new Redis({
-    host: process.env.REDIS_HOST || '67.217.60.234',
-    port: parseInt(process.env.REDIS_PORT || '6379', 10)
-});
-redis.on('error', (err) => console.error('[dailyrecap redis] ', err.message));
+// ---------------------------------------------------------------------------
+// Auth middleware — validate X-Daily-Recap-Token header
+// ---------------------------------------------------------------------------
+function validateToken(req) {
+    const expected = process.env.DAILY_RECAP_TOKEN;
+    if (!expected) {
+        // Token not configured — allow (bot may be in dev mode)
+        return true;
+    }
+    const provided = req.headers['x-daily-recap-token'];
+    return provided && provided === expected;
+}
 
-/**
- * Bind template + data via the official Adaptive Cards Templating SDK.
- * Wraps data in `$root` per SDK convention so `${foo}` resolves to
- * `data.foo` and `${$root.foo}` resolves the same.
- */
+// ---------------------------------------------------------------------------
+// Bind template + data via the official Adaptive Cards Templating SDK.
+// Wraps data in `$root` per SDK convention so `${foo}` resolves to
+// `data.foo` and `${$root.foo}` resolves the same.
+// ---------------------------------------------------------------------------
 function bindCard(template, data) {
     const tpl = new Template(template);
     return tpl.expand({ $root: data });
 }
 
-/**
- * Schedule a one-shot deletion of an activity from the conversation
- * after `delayMs` milliseconds.  Uses `adapter.continueConversation`
- * so the timer can run after the original turn / proactive send has
- * completed.  Best-effort — failures are logged, never thrown, and
- * the timer is unrefed so it doesn't block process shutdown.
- *
- * Note: Microsoft Teams allows a bot to delete only its own messages,
- * and only within the bot's app-permission window.  The delete will
- * silently fail if the bot lacks permission or the message has already
- * been removed.
- */
+// ---------------------------------------------------------------------------
+// Schedule a one-shot deletion of an activity after `delayMs` milliseconds.
+// Uses `adapter.continueConversation` so the timer can run after the
+// original turn / proactive send has completed.  Best-effort — failures
+// are logged, never thrown, and the timer is unrefed so it doesn't block
+// process shutdown.
+//
+// Note: Microsoft Teams allows a bot to delete only its own messages,
+// and only within the bot's app-permission window.  The delete will
+// silently fail if the bot lacks permission or the message has already
+// been removed.
+// ---------------------------------------------------------------------------
 function scheduleAutoDelete(conversationReference, activityId, delayMs) {
     if (!activityId) {
         return;
     }
     const timer = setTimeout(async () => {
+        _pendingDeletes.delete(activityId);
         try {
-            await adapter.continueConversation(conversationReference, async (proactiveContext) => {
+            await getAdapter().continueConversation(conversationReference, async (proactiveContext) => {
                 await proactiveContext.deleteActivity(activityId);
             });
         } catch (err) {
@@ -96,17 +104,18 @@ function scheduleAutoDelete(conversationReference, activityId, delayMs) {
     if (typeof timer.unref === 'function') {
         timer.unref();
     }
+    _pendingDeletes.set(activityId, { timer, conversationReference, delayMs });
 }
 
-/**
- * Send an attachment proactively to a stored conversation reference,
- * with retry on transient/auth failures.  Returns the outgoing
- * activity ID so callers can update it later via Action.Submit.
- */
+// ---------------------------------------------------------------------------
+// Send an attachment proactively to a stored conversation reference,
+// with retry on transient/auth failures.  Returns the outgoing
+// activity ID so callers can update it later via Action.Submit.
+// ---------------------------------------------------------------------------
 async function sendProactiveCard(conversationReference, card) {
     let activityId = null;
     await runWithRetry(async () => {
-        await adapter.continueConversation(conversationReference, async (proactiveContext) => {
+        await getAdapter().continueConversation(conversationReference, async (proactiveContext) => {
             const sent = await proactiveContext.sendActivity({
                 type: 'message',
                 attachments: [{
@@ -124,7 +133,58 @@ async function sendProactiveCard(conversationReference, card) {
     return activityId;
 }
 
+// ---------------------------------------------------------------------------
+// Attempt to reduce card size to fit within Teams' 25 KB limit.
+// Returns the modified card object (may be the same reference if already small).
+// Strips large image URLs, truncates long text fields, and removes empty arrays.
+// ---------------------------------------------------------------------------
+function enforceCardSizeLimit(card) {
+    const clone = JSON.parse(JSON.stringify(card));
+    _enforceRecursive(clone, 0);
+    return clone;
+}
+
+function _enforceRecursive(obj, depth) {
+    if (depth > 20) return; // prevent stack overflow on deeply nested cards
+    if (!obj || typeof obj !== 'object') return;
+
+    if (Array.isArray(obj)) {
+        for (const item of obj) _enforceRecursive(item, depth + 1);
+        return;
+    }
+
+    // Truncate long text values
+    if (typeof obj.text === 'string' && obj.text.length > 2000) {
+        obj.text = obj.text.slice(0, 2000) + '…';
+    }
+    if (typeof obj.speak === 'string' && obj.speak.length > 1000) {
+        obj.speak = obj.speak.slice(0, 1000) + '…';
+    }
+
+    // Remove base64 image URLs (they bloat the card)
+    if (typeof obj.url === 'string' && obj.url.startsWith('data:')) {
+        obj.url = '';
+    }
+    if (typeof obj.image === 'string' && obj.image.startsWith('data:')) {
+        obj.image = '';
+    }
+
+    // Trim empty arrays to save space
+    for (const [key, val] of Object.entries(obj)) {
+        if (Array.isArray(val) && val.length === 0) {
+            delete obj[key];
+        } else {
+            _enforceRecursive(val, depth + 1);
+        }
+    }
+}
+
 const dailyRecapHandler = async (req, res) => {
+    // Auth check
+    if (!validateToken(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid or missing X-Daily-Recap-Token header' });
+    }
+
     const { template, data, channel } = req.body || {};
     if (!template || typeof template !== 'object') {
         return res.status(400).json({ ok: false, error: 'missing or non-object "template"' });
@@ -156,8 +216,21 @@ const dailyRecapHandler = async (req, res) => {
     }
 
     const cardJson = JSON.stringify(card);
-    if (cardJson.length > 25 * 1024) {
-        console.warn(`[dailyrecap] bound card is ${ Math.round(cardJson.length / 1024) } KB — Teams' 25 KB Adaptive Card limit may drop it silently`);
+    const cardSize = cardJson.length;
+
+    // Enforce Teams' 25 KB Adaptive Card limit
+    if (cardSize > MAX_CARD_BYTES) {
+        const originalSizeKB = Math.round(cardSize / 1024);
+        card = enforceCardSizeLimit(card);
+        const newSize = JSON.stringify(card).length;
+        const newSizeKB = Math.round(newSize / 1024);
+        console.warn(`[dailyrecap] card ${ originalSizeKB } KB exceeded limit — trimmed to ${ newSizeKB } KB`);
+        if (newSize > MAX_CARD_BYTES) {
+            return res.status(400).json({
+                ok: false,
+                error: `bound card is ${ originalSizeKB } KB (limit 25 KB) and could not be trimmed enough`
+            });
+        }
     }
 
     let activityId;
@@ -192,12 +265,15 @@ const dailyRecapHandler = async (req, res) => {
         activityId,
         conversationId,
         channel,
-        bytes_sent:     cardJson.length
+        bytes_sent:     JSON.stringify(card).length
     });
 };
 
+// Expose for tests
 module.exports = dailyRecapHandler;
 module.exports.CHANNELS = CHANNELS;
 module.exports.bindCard = bindCard;
 module.exports.scheduleAutoDelete = scheduleAutoDelete;
 module.exports.AUTO_DELETE_MS = AUTO_DELETE_MS;
+module.exports.enforceCardSizeLimit = enforceCardSizeLimit;
+module.exports.validateToken = validateToken;

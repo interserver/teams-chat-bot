@@ -8,8 +8,8 @@
 // against the shared channels map. Retry logic now lives in
 // server/lib/retry.js.
 
-const { BotFrameworkAdapter } = require('botbuilder');
-const Redis = require('ioredis');
+const { getAdapter } = require('../lib/adapter');
+const { createBotRedis } = require('../lib/redis');
 const { runWithRetry } = require('../lib/retry');
 const { resolve: resolveChannel } = require('../queue/channels');
 
@@ -17,25 +17,11 @@ const { resolve: resolveChannel } = require('../queue/channels');
 // from this array or set SKIP_CHANNELS="" in your .env file.
 const SKIP_CHANNELS = [];
 
-const adapter = new BotFrameworkAdapter({
-    appId: process.env.MicrosoftAppId,
-    appPassword: process.env.MicrosoftAppPassword
-});
-
-adapter.onTurnError = async (context, error) => {
-    console.error(`\n [msg onTurnError] unhandled error: ${ error }`);
-};
-
-const redis = new Redis({
-    host: process.env.REDIS_HOST || '67.217.60.234',
-    port: parseInt(process.env.REDIS_PORT || '6379', 10)
-});
-redis.on('connect', () => console.log('✅ Connected to Redis (msgController)'));
-redis.on('error', (err) => console.error('❌ Redis error (msgController):', err.message));
+const redis = createBotRedis();
 
 async function sendProactiveMessage(conversationReference, messageText) {
     return runWithRetry(async () => {
-        await adapter.continueConversation(conversationReference, async (proactiveContext) => {
+        await getAdapter().continueConversation(conversationReference, async (proactiveContext) => {
             await proactiveContext.sendActivity(messageText);
         });
     }, {

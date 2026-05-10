@@ -113,14 +113,16 @@ async function testCmd(context, redis, rest) {
         await context.sendActivity(MessageFactory.text(`unknown room "${ room }"`));
         return;
     }
+    // Sanitize: trim, cap message length to 4000 chars (Teams message limit)
+    const safeMsg = String(msg).slice(0, 4000);
     const envelope = {
         v: 1,
         id: 'test-' + Date.now(),
         ts: Math.floor(Date.now() / 1000),
         expires_at: Math.floor(Date.now() / 1000) + 300,
-        room,
+        room: room.trim(),
         type: 'msg',
-        message: msg,
+        message: safeMsg,
         card: null,
         extra: { dedup_key: 'admin:test', level: 'info', source: 'commands/notifAdmin' },
         fallback_webhook_url: null
@@ -143,7 +145,7 @@ async function drainDeadCmd(context, redis) {
 }
 
 async function seedRoomCmd(context, redis, rest) {
-    const room = rest.trim();
+    const room = String(rest).trim().slice(0, 64);
     if (!room) {
         await context.sendActivity(MessageFactory.text('usage: `!notif seed-room <room>`'));
         return;

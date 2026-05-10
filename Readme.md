@@ -218,88 +218,121 @@ To learn more about deploying a bot to Azure, see [Deploy your bot to Azure](htt
 
 ## Changelog
 
-### Latest Changes (Daily Recap, Notification Queue, Adaptive Card Templating)
+### v2 — Notification Queue, Daily Recap Cards, Architecture Modernisation
+
+This release adds a Redis-backed notification queue consumer, a daily recap Adaptive Card system, and a major architectural cleanup (shared adapter, shared Redis factory, rate limiting, auth).
+
+---
 
 #### New Features
 
-- **Daily Recap Card API** (`POST /api/dailyrecap`)
-  - Proactively post Adaptive Cards built from Adaptive Cards Templating template + data pairs
-  - Server-side template binding via `adaptivecards-templating` SDK (Teams cannot expand templating syntax client-side)
-  - Auto-delete sent cards after 5 minutes to avoid channel clutter
-  - Caches template/data in Redis for later `Action.Submit` toggling
+**Daily Recap Card API** (`POST /api/dailyrecap`)
+- Proactively post Adaptive Cards built from Adaptive Cards Templating template + data pairs
+- Server-side binding via `adaptivecards-templating` SDK — Teams cannot expand `${...}` templating syntax client-side
+- `X-Daily-Recap-Token` header validated against `DAILY_RECAP_TOKEN` env var
+- Auto-deletes the sent card after 5 minutes to avoid channel clutter
+- Caches template+data in Redis (`dailyrecap:{activityId}`, 2-day TTL) for later `Action.Submit` toggle edits
+- Card size enforcement: cards over 25 KB are trimmed (text truncation, base64 image removal, empty-array pruning); if still too large the request is rejected with 400
+- Response: `{ ok, activityId, conversationId, channel, bytes_sent }`
 
-- **`daily recap` Bot Command**
-  - Admin command fetches daily recap card from MyAdmin endpoint and posts to current channel
-  - Compact mode trims card to stay under Teams' 25 KB Adaptive Card limit
-  - Auto-delete after 5 minutes
+**`daily recap` Bot Command** (admin-only)
+- Fetches the card template+data from `DAILY_RECAP_URL` and posts it to the current channel
+- Compact mode trims the card so it stays under Teams' 25 KB Adaptive Card limit
+- Auto-deletes after 5 minutes
 
-- **Notification Queue Consumer** (`server/queue/notificationConsumer.js`)
-  - Polls Redis (`notif:queue`) on a configurable interval
-  - Per-room edit/coalesce/new send decisions
-  - Edit window: within 30 minutes,同一个 `dedup_key` 的多条消息会合并到同一条活动
-  - Coalescing: multiple non-deduped messages combined into one activity
-  - Fallback to Power Automate webhook if Bot Framework delivery fails
-  - Dead-letter queue for failed/expired envelopes
-  - Filtering: noisy GitHub events (check_run, workflow_job, star, fork, etc.) redirected to `int-dev-announce` instead of flooding primary channels
+**Notification Queue Consumer** (`server/queue/notificationConsumer.js`)
+- Polls Redis (`notif:queue`) on a configurable interval; speeds up to `NOTIF_POLL_FAST_MS` after activity
+- Per-tick batch limit (`NOTIF_MAX_PER_TICK`, default 50)
+- Three send modes per room:
+  - **Trackable** (envelopes with `extra.dedup_key`): edits the most recent activity within a 30-minute window; appends a timestamped line up to 3 times, then summarises as "N updates · last HH:MM"
+  - **Coalesced** (2–8 non-deduped messages): combined into one activity, separated by `— · —` dividers
+  - **Single** (one non-deduped message): sent as a new activity
+- **Edit coalescing**: messages with the same `dedup_key` within `NOTIF_EDIT_WINDOW_MS` (default 30 min) update the same activity instead of spawning new ones
+- **Fallback to Power Automate webhook**: if `adapter.continueConversation` fails after retries, the envelope's `fallback_webhook_url` is used
+- **Dead-letter queue** (`notif:dead`): failed/expired envelopes stored with `_dead_reason` and `_dead_at`; `!notif drain-dead` re-queues them
+- **GitHub noise filtering** (`server/queue/filters.js`): `check_run`, `workflow_job`, `check_suite`, `workflow_run`, `star`, `watch`, `fork`, `ping` events are silently dropped or redirected to `int-dev-announce` with a visible label; control via `NOTIF_FILTER_ENABLED=0`
+- Recovery on startup: any items left in `notif:processing` (from a crashed tick) are moved back to `notif:queue`
+- Metrics counters: `notif:metrics:enqueued`, `sent`, `edited`, `coalesced`, `redirected`, `fallback`, `dead`
+- Heartbeat logging every `NOTIF_HEARTBEAT_MS` (default 60s) when the queue is idle
 
-- **`!notif` Admin Commands**
-  - `!notif status` — queue/processing/dead depths and metrics
-  - `!notif rooms` — list known rooms with ✅/❌ convref status
-  - `!notif test <room> <msg>` — enqueue a probe envelope
-  - `!notif drain-dead` — re-queue everything in `notif:dead`
-  - `!notif seed-room <room>` — check/seed conversation reference for a room
+**`!notif` Admin Commands** (via `server/commands/notifAdmin.js`)
+- `!notif status` — queue/processing/dead depths + all metric counters
+- `!notif rooms` — table of known rooms; ✅ = convref cached, ❌ = bot needs to observe inbound activity first
+- `!notif test <room> <msg>` — enqueues a probe envelope (dedup_key: `admin:test`); message capped at 4000 chars
+- `!notif drain-dead` — moves all entries from `notif:dead` back to `notif:queue`
+- `!notif seed-room <room>` — reports whether a conversation reference exists for the named room; room name capped at 64 chars
 
-- **Channel Sync on Startup**
-  - New `CHANNEL_SYNC_ENABLED=1` env var enables proactive probing of all channels on startup
-  - Bot sends a sync-check message to each channel that lacks a stored `convref`
-  - Ensures channels added after bot deploy can receive proactive messages
+**Channel Sync on Startup**
+- Set `CHANNEL_SYNC_ENABLED=1` to probe every channel in `CHANNELS` on startup
+- Channels without a stored `convref` receive an invisible zero-width-space message (`\u200b`) which is deleted after 500ms — registers the bot's presence without polluting the channel
+- The `onMessage` handler already stores `convref:*` keys on every inbound message; sync fills gaps for channels added after deployment
 
-- **Constructed ConversationReference Fallback**
-  - When no `convref` is stored for a room, notification consumer attempts to send using a constructed reference
-  - Uses standard Teams service URL (`https://smba.trafficmanager.net/teams/`)
-  - Falls back to webhook if even the constructed reference fails
+**Constructed ConversationReference Fallback**
+- When no `convref` is stored for a room (e.g. the bot was never observed there), `tryConstructedConvRef` attempts the send using a minimal reference with the known `conversationId`
+- Uses configurable `TEAMS_SERVICE_URL` env var (supports GCC/GCC High if the correct URL is set)
+- Falls back to the envelope's `fallback_webhook_url` if even the constructed reference fails
 
-#### Refactoring
+---
 
-- **Shared Retry Library** (`server/lib/retry.js`)
-  - Centralized retry logic replacing inline loops in `botController.js` and `msgController.js`
-  - Exponential backoff with jitter (base 750ms, cap 8s)
-  - Catches transient errors, auth failures, and rate limits
-  - Re-trusts `serviceUrl` on auth failures (original behavior preserved)
+#### Architecture / Refactoring
 
-- **Channel-Based Routing**
-  - `msgController.js` now accepts `channel` in request body and resolves via `CHANNELS` map
-  - Hardcoded `int-dev-private` removed — channel is now configurable per-request
-  - `SKIP_CHANNELS` array allows disabling channels without code changes
+**Shared BotFrameworkAdapter** (`server/lib/adapter.js`)
+- Single adapter singleton shared by `botController`, `msgController`, `dailyRecapController`, `notificationConsumer`, and `botActivityHandler`
+- Credentials and token cache are pooled; `onTurnError` handled per-module where needed
+- `setAdapter()` allows test injection
 
-- **BotFrameworkAdapter Instances**
-  - `msgController.js`, `dailyRecapController.js`, and `botActivityHandler.js` each create their own adapter instances
-  - `botActivityHandler` exports its adapter for use by startup sync
+**Shared Redis Factory** (`server/lib/redis.js`)
+- `createBotRedis()` — for `convref:*` keys; supports `REDIS_USER`/`REDIS_PASSWORD` auth; `maxRetriesPerRequest: 3`
+- `createNotifRedis()` — for the notification queue; separate host via `REDIS_HOST_MY`/`REDIS_PORT_MY`
+- `TEAMS_SERVICE_URL` — single source of truth for the Teams endpoint (default: `https://smba.trafficmanager.net/teams/`); overridden by env var for GCC/GCC High
+
+**Shared Retry Library** (`server/lib/retry.js`)
+- Exponential backoff with jitter (base 750ms, cap 8s) replacing inline retry loops
+- Classifies errors as `transient`, `auth`, or `rateLimit`; re-trusts `serviceUrl` on auth failures
+- Used by all outbound Bot Framework calls across the codebase
+
+**Channel-Based Routing**
+- `msgController.js` now accepts `channel` in the request body and resolves it via `CHANNELS` map
+- Hardcoded `int-dev-private` target removed; the caller specifies the channel
+- `SKIP_CHANNELS` array disables specific channels without code changes
+
+**Rate Limiting**
+- `express-rate-limit` added as a dependency
+- General `/api` limit: 60 req/min per IP (`RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`)
+- Proactive-send endpoints (`/api/message`, `/api/dailyrecap`): 30 req/min per IP+channel (`RATE_LIMIT_SEND_WINDOW_MS`, `RATE_LIMIT_SEND_MAX`)
+
+---
 
 #### Infrastructure
 
-- **Dual Redis Configuration**
-  - Notification queue consumer uses separate Redis connection (`REDIS_HOST_MY`/`REDIS_PORT_MY`)
-  - Bot's `convref:*` keys still live on primary Redis (`REDIS_HOST`/`REDIS_PORT`)
-  - Supports authenticated Redis for bot Redis, unauthenticated for queue Redis
+**New Environment Variables**
 
-- **New Environment Variables**
-  - `DAILY_RECAP_URL` — MyAdmin daily recap card endpoint
-  - `DAILY_RECAP_TOKEN` — Shared secret for daily recap auth
-  - `NOTIF_POLL_MS` — Queue poll interval (default 5000ms)
-  - `NOTIF_POLL_FAST_MS` — Fast poll interval after activity (default 1000ms)
-  - `NOTIF_MAX_PER_TICK` — Max envelopes per poll (default 50)
-  - `NOTIF_COALESCE_MAX_CHARS` — Max chars per coalesced message (default 24000)
-  - `NOTIF_COALESCE_MAX_ITEMS` — Max items per coalesced message (default 8)
-  - `NOTIF_EDIT_WINDOW_MS` — Dedup edit window (default 30 minutes)
-  - `NOTIF_KEY_PREFIX` — Redis key prefix for queue (default `notif:`)
-  - `NOTIF_HEARTBEAT_MS` — Heartbeat log interval (default 60000ms)
-  - `NOTIF_FILTER_ENABLED` — Set to `0` to bypass GitHub noise filters
-  - `NOTIF_CONSUMER_ENABLED` — Set to `0` to disable notification consumer
-  - `CHANNEL_SYNC_ENABLED` — Set to `1` to enable channel sync on startup
-  - `REDIS_HOST_MY` / `REDIS_PORT_MY` — Notification queue Redis host/port
-  - `REDIS_USER` / `REDIS_PASSWORD` — Bot Redis authentication (optional)
+| Variable | Default | Purpose |
+|---|---|---|
+| `DAILY_RECAP_URL` | `https://mystage.interserver.net/admin/ajax/daily_recap_card_api.php` | MyAdmin daily recap endpoint |
+| `DAILY_RECAP_TOKEN` | _(none)_ | Shared secret for daily recap auth |
+| `REDIS_HOST_MY` / `REDIS_PORT_MY` | `67.217.60.234` / `6379` | Notification queue Redis |
+| `REDIS_USER` / `REDIS_PASSWORD` | _(none)_ | Bot Redis authentication |
+| `TEAMS_SERVICE_URL` | `https://smba.trafficmanager.net/teams/` | Teams API endpoint (change for GCC/GCC High) |
+| `NOTIF_POLL_MS` | `5000` | Queue poll interval (ms) |
+| `NOTIF_POLL_FAST_MS` | `1000` | Poll interval after activity (ms) |
+| `NOTIF_MAX_PER_TICK` | `50` | Max envelopes per poll |
+| `NOTIF_COALESCE_MAX_CHARS` | `24000` | Max chars in a coalesced message |
+| `NOTIF_COALESCE_MAX_ITEMS` | `8` | Max items in a coalesced message |
+| `NOTIF_EDIT_WINDOW_MS` | `1800000` (30 min) | Dedup edit window |
+| `NOTIF_KEY_PREFIX` | `notif:` | Redis key prefix |
+| `NOTIF_HEARTBEAT_MS` | `60000` | Heartbeat log interval (ms) |
+| `NOTIF_FILTER_ENABLED` | `1` | Set `0` to bypass GitHub noise filters |
+| `NOTIF_CONSUMER_ENABLED` | `1` | Set `0` to disable notification consumer |
+| `CHANNEL_SYNC_ENABLED` | `0` | Set `1` to probe channels on startup |
+| `RATE_LIMIT_WINDOW_MS` | `60000` | General rate limit window |
+| `RATE_LIMIT_MAX` | `60` | General rate limit max reqs |
+| `RATE_LIMIT_SEND_WINDOW_MS` | `60000` | Send-endpoint rate limit window |
+| `RATE_LIMIT_SEND_MAX` | `30` | Send-endpoint rate limit max reqs |
 
-- **`/health/queue` Endpoint**
-  - Returns queue depth, processing depth, dead count, poll interval, and last tick stats
-  - Useful for monitoring and alerting
+**`/health/queue` Endpoint**
+- Returns `{ status, running, queue_depth, processing_depth, dead_depth, poll_interval_ms, edit_window_ms, max_per_tick, last_tick }`
+- Useful for monitoring dashboards and alerting
+
+**`.logs/` in `.gitignore`**
+- Local log output directories are now ignored

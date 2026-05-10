@@ -4,6 +4,7 @@
 const path = require('path');
 const express = require('express');
 const dotenv = require('dotenv');
+const rateLimit = require('express-rate-limit');
 
 // Load environment variables from .env file
 const ENV_FILE = path.join(__dirname, '../.env');
@@ -15,11 +16,37 @@ validateEnv();
 
 const server = express();
 
+// ---------------------------------------------------------------------------
+// Rate limiting — protect API endpoints from abuse.
+// Configurable via env vars; defaults are conservative.
+// ---------------------------------------------------------------------------
+const apiLimiter = rateLimit({
+    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10),  // 1 minute
+    max: parseInt(process.env.RATE_LIMIT_MAX || '60', 10),                 // 60 req/min per IP
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later.' }
+});
+
+// Stricter limit for proactive-send endpoints to prevent accidental hammering
+const sendLimiter = rateLimit({
+    windowMs: parseInt(process.env.RATE_LIMIT_SEND_WINDOW_MS || '60000', 10),
+    max: parseInt(process.env.RATE_LIMIT_SEND_MAX || '30', 10),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Send limit exceeded, please slow down.' },
+    keyGenerator: (req) => {
+        // Rate limit by channel + IP so each channel gets its own quota
+        const channel = req.body && req.body.channel ? `:${ req.body.channel }` : '';
+        return `${ req.ip }${ channel }`;
+    }
+});
+
 const { startConsumer, stopConsumer, getHealth: getQueueHealth } = require('./queue/notificationConsumer');
 const { botActivityHandler } = require('./api/botController');
 
-// Use the API routes
-server.use('/api', require('./api'));
+// Apply general rate limiting to /api
+server.use('/api', apiLimiter, require('./api'));
 
 // Health check endpoint
 server.get('/health', (_req, res) => {

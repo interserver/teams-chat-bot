@@ -10,13 +10,13 @@
 //   - PHP: NotificationQueue (webhooks.interserver.net)
 // See those classes for the canonical schema (v=1).
 
-const Redis = require('ioredis');
 const axios = require('axios');
-const { BotFrameworkAdapter } = require('botbuilder');
 
 const { runWithRetry, classify } = require('../lib/retry');
 const { resolve: resolveChannel } = require('./channels');
 const { shouldSkip } = require('./filters');
+const { getAdapter } = require('../lib/adapter');
+const { createNotifRedis, createBotRedis, TEAMS_SERVICE_URL } = require('../lib/redis');
 
 const POLL_INTERVAL_MS = parseInt(process.env.NOTIF_POLL_MS || '5000', 10);
 const POLL_INTERVAL_FAST_MS = parseInt(process.env.NOTIF_POLL_FAST_MS || '1000', 10);
@@ -46,44 +46,6 @@ let redis = null;
 // existing bot Redis (Dragonfly, possibly behind auth) and we need it to
 // resolve where to send proactive activities.
 let redisBot = null;
-let adapter = null;
-
-function buildAdapter() {
-    return new BotFrameworkAdapter({
-        appId: process.env.MicrosoftAppId,
-        appPassword: process.env.MicrosoftAppPassword
-    });
-}
-
-function buildNotifRedis() {
-    const host = process.env.REDIS_HOST_MY || '67.217.60.234';
-    const port = parseInt(process.env.REDIS_PORT_MY || '6379', 10);
-    const r = new Redis({
-        host,
-        port,
-        lazyConnect: false,
-        maxRetriesPerRequest: 3
-    });
-    r.on('connect', () => console.log(`[notif] connected to notif redis ${ host }:${ port }`));
-    r.on('error', (err) => console.error('[notif] notif redis error:', err.message));
-    return r;
-}
-
-function buildBotRedis() {
-    const opts = {
-        host: process.env.REDIS_HOST || '67.217.60.234',
-        port: parseInt(process.env.REDIS_PORT || '6379', 10),
-        lazyConnect: false,
-        maxRetriesPerRequest: 3
-    };
-    if (process.env.REDIS_USER) opts.username = process.env.REDIS_USER;
-    if (process.env.REDIS_PASSWORD || process.env.REDIS_PASS) {
-        opts.password = process.env.REDIS_PASSWORD || process.env.REDIS_PASS;
-    }
-    const r = new Redis(opts);
-    r.on('error', (err) => console.error('[notif] bot redis error:', err.message));
-    return r;
-}
 
 function startConsumer() {
     if (timer) return;
@@ -91,9 +53,9 @@ function startConsumer() {
         console.log('[notif] consumer disabled via NOTIF_CONSUMER_ENABLED=0');
         return;
     }
-    redis = buildNotifRedis();
-    redisBot = buildBotRedis();
-    adapter = buildAdapter();
+    redis = createNotifRedis();
+    redisBot = createBotRedis();
+    adapter = getAdapter();
     const notifHost = process.env.REDIS_HOST_MY || '67.217.60.234';
     const notifPort = process.env.REDIS_PORT_MY || '6379';
     const botHost = process.env.REDIS_HOST || '67.217.60.234';
@@ -689,9 +651,8 @@ async function loadConvRef(conversationId) {
 // before onInstallationUpdateAdd started capturing convrefs).
 // Returns true if successful, false otherwise.
 async function tryConstructedConvRef(room, conversationId, activity, stats) {
-    // Standard Teams service URL - works for commercial Teams.
-    // For GCC/GCC High, this would be different but we don't have that info.
-    const SERVICE_URL = 'https://smba.trafficmanager.net/teams/';
+    // Use configurable service URL (supports GCC/GCC High via TEAMS_SERVICE_URL env var)
+    const SERVICE_URL = TEAMS_SERVICE_URL;
 
     // Construct a minimal ConversationReference with what we know.
     // The key fields needed are serviceUrl and conversation.id.
@@ -700,7 +661,7 @@ async function tryConstructedConvRef(room, conversationId, activity, stats) {
         serviceUrl: SERVICE_URL,
         conversation: {
             id: conversationId,
-            name: 'int-dev-announce',
+            name: room,  // use the actual room name, not a hardcoded value
             isGroup: true
         },
         aadObjectId: process.env.BOT_AAD_OBJECT_ID || 'unknown',
