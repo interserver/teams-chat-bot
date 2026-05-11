@@ -2,12 +2,16 @@
 // Licensed under the MIT License.
 
 const { TurnContext, TeamsInfo, TeamsActivityHandler, MessageFactory } = require('botbuilder');
+const { MicrosoftAppCredentials } = require('botframework-connector');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
-const Redis = require('ioredis');
 const { MongoClient } = require('mongodb');
 const mysql = require('mysql2/promise');
 const { dispatch } = require('../commands');
+const { CHANNELS } = require('../queue/channels');
+const { runWithRetry } = require('../lib/retry');
+const { getAdapter } = require('../lib/adapter');
+const { createBotRedis, TEAMS_SERVICE_URL } = require('../lib/redis');
 
 /*
 notifications 19:028421460efc48f89e00d1c7217bad63@thread.v2
@@ -39,10 +43,8 @@ class BotActivityHandler extends TeamsActivityHandler {
             })
             .catch((err) => console.error('❌ MySQL error:', err));
 
-        // Redis
-        this.redis = new Redis({ host: process.env.REDIS_HOST || 'dragonfly.mailbaby.net', port: parseInt(process.env.REDIS_PORT || '6379', 10) });
-        this.redis.on('connect', () => console.log('✅ Connected to Redis'));
-        this.redis.on('error', (err) => console.error('❌ Redis error:', err));
+        // Redis (shared bot Redis)
+        this.redis = createBotRedis();
 
         // MongoDB
         const mongoClient = new MongoClient(`mongodb://${ encodeURIComponent(process.env.ZONEMTA_USERNAME) }:${ encodeURIComponent(process.env.ZONEMTA_PASSWORD) }@${ process.env.ZONEMTA_HOST }:27017/`);
@@ -78,7 +80,11 @@ class BotActivityHandler extends TeamsActivityHandler {
         // Activity called when there's a message in channel
         this.onMessage(async (context, next) => {
             const conversationReference = TurnContext.getConversationReference(context.activity);
-            await this.redis.set(`convref:${ conversationReference.conversation.id }`, JSON.stringify(conversationReference));
+            const convId = conversationReference.conversation.id;
+            // Store convref - also covers RSC-enabled channels that missed
+            // onInstallationUpdateAdd (e.g., channels added to CHANNELS after bot deploy)
+            await this.redis.set(`convref:${ convId }`, JSON.stringify(conversationReference));
+            console.log(`[convref] stored for conversation ${ convId } via onMessage`);
             const text = (context.activity.text || '').trim();
             const lcText = text.toLowerCase();
             const userId = context.activity.from.id;
@@ -146,6 +152,11 @@ class BotActivityHandler extends TeamsActivityHandler {
         this.onInstallationUpdateAdd(async (context, next) => {
             console.log('got onInstallationUpdateAdd event');
             console.log(context.activity);
+            // Store ConversationReference so the notification consumer can send
+            // proactive messages to this channel without requiring an inbound message first.
+            const conversationReference = TurnContext.getConversationReference(context.activity);
+            await this.redis.set(`convref:${ conversationReference.conversation.id }`, JSON.stringify(conversationReference));
+            console.log(`[convref] stored for conversation ${ conversationReference.conversation.id }`);
             await next();
         });
 
@@ -299,6 +310,85 @@ class BotActivityHandler extends TeamsActivityHandler {
             await context.sendActivity(MessageFactory.text(`No matching server "${ server }" found in any master table`));
             console.log(`No matching server "${ server }" found in any master table`);
         }
+    }
+
+    // Probe a channel to register the bot's presence and capture the convref.
+    // Sends a "soft" message — invisible formatting (zero-width space + mention)
+    // followed immediately by deletion — so the channel is left clean.
+    async probeChannel(channelName, conversationId) {
+        const serviceUrl = TEAMS_SERVICE_URL;
+        const convRef = {
+            channelId: 'msteams',
+            conversation: { id: conversationId, name: channelName, isGroup: true },
+            serviceUrl,
+            aadObjectId: process.env.BOT_AAD_OBJECT_ID || 'unknown',
+            tenantId: process.env.BOT_TENANT_ID || 'unknown',
+            bot: { id: process.env.MicrosoftAppId, name: 'teams-chat-bot' }
+        };
+
+        try {
+            let activityId = null;
+            await runWithRetry(async () => {
+                await MicrosoftAppCredentials.trustServiceUrl(serviceUrl);
+                await getAdapter().continueConversation(convRef, async (proactiveContext) => {
+                    // Send a barely-visible "probe" message then delete it.
+                    // Teams still delivers the activity which registers our presence.
+                    const sent = await proactiveContext.sendActivity({
+                        type: 'message',
+                        text: '\u200b', // zero-width space — visually invisible
+                        textFormat: 'plain'
+                    });
+                    activityId = sent && sent.id ? sent.id : null;
+                });
+            }, {
+                label: `sync probe ${ channelName }`,
+                serviceUrl,
+                maxRetries: 2
+            });
+
+            // Best-effort delete immediately after send
+            if (activityId) {
+                setTimeout(async () => {
+                    try {
+                        await getAdapter().continueConversation(convRef, async (proactiveContext) => {
+                            await proactiveContext.deleteActivity(activityId);
+                        });
+                    } catch (_) { /* delete is best-effort */ }
+                }, 500);
+            }
+
+            console.log(`[sync] probe OK ${ channelName }`);
+            return true;
+        } catch (err) {
+            console.error(`[sync] probe failed ${ channelName }: ${ err.message }`);
+            return false;
+        }
+    }
+
+    async syncConversationReferences() {
+        const channelEntries = Object.entries(CHANNELS);
+        console.log(`[sync] checking ${ channelEntries.length } channels for convrefs...`);
+
+        let probed = 0;
+        let hadConvref = 0;
+
+        for (const [channelName, conversationId] of channelEntries) {
+            const redisKey = `convref:${ conversationId }`;
+            const stored = await this.redis.get(redisKey);
+
+            if (stored) {
+                console.log(`[sync] stored convref for ${ channelName } (${ conversationId })`);
+                hadConvref++;
+                continue;
+            }
+
+            console.log(`[sync] missing convref for ${ channelName } (${ conversationId }) - probing`);
+
+            const ok = await this.probeChannel(channelName, conversationId);
+            if (ok) probed++;
+        }
+
+        console.log(`[sync] complete - ${ probed } channels probed, ${ hadConvref } had convrefs`);
     }
 }
 

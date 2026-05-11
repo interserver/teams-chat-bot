@@ -20,6 +20,8 @@
   "dependencies": {
     "@microsoft/microsoft-graph-client": "~2.0.0",
     "@octokit/rest": "^22.0.1",
+    "adaptive-expressions": "^4.23.3",
+    "adaptivecards-templating": "^2.3.1",
     "axios": "^1.7.0",
     "body-parser": "^1.19.0",
     "botbuilder": "^4.23.2",
@@ -29,6 +31,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
+    "express-rate-limit": "^7.5.0",
     "html-entities": "^1.4.0",
     "ioredis": "*",
     "memorystorage": "^0.12.0",

@@ -21,6 +21,8 @@ const commands = [
     require('./hypervStatus'),
     require('./processingStatus'),
     require('./globalVar'),
+    require('./dailyRecap'),
+    require('./notifAdmin'),
     require('./help')
 ];
 
