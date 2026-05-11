@@ -28,10 +28,185 @@ const KEY_PREFIX = process.env.NOTIF_KEY_PREFIX || 'notif:';
 const HEARTBEAT_MS = parseInt(process.env.NOTIF_HEARTBEAT_MS || '60000', 10);
 const APPEND_BREAK = '\n\n— · —\n\n';
 const APPEND_TRAIL_SUMMARY_AFTER = 3;
+// GitHub commit grouping window — if no event for a given commit SHA arrives
+// within this many ms of the last edit, a new message is started.
+const COMMIT_GROUP_WINDOW_MS = parseInt(process.env.NOTIF_COMMIT_GROUP_WINDOW_MS || '180000', 10); // 3 min
 
 function k(name) { return KEY_PREFIX + name; }
 function recentKey(room) { return k('recent:') + room; }
 function metric(name) { return k('metrics:') + name; }
+
+// ---------------------------------------------------------------------------
+// GitHub commit SHA extraction
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the commit SHA from a GitHub envelope.
+ * Returns null if the SHA cannot be determined.
+ */
+function extractCommitSha(env) {
+    const extra = env.extra || {};
+    const data = extra.data || {};
+    const eventType = extra.event_type || '';
+
+    let sha = null;
+
+    if (eventType === 'check_run' || eventType === 'check_suite') {
+        sha = data.check_run?.check_suite?.head_sha
+            || data.check_run?.head_sha
+            || data.check_suite?.head_sha
+            || null;
+    } else if (eventType === 'workflow_job' || eventType === 'workflow_run') {
+        sha = data.workflow_job?.head_sha
+            || data.workflow_run?.head_sha
+            || null;
+    } else if (eventType === 'push') {
+        // commits[0].id is the "after" SHA for a push event
+        sha = data.commits?.[0]?.id || data.after || null;
+    } else if (eventType === 'commit_comment') {
+        sha = data.comment?.commit_id || null;
+    } else if (eventType === 'pull_request') {
+        // Use the merge commit SHA (head SHA) if available
+        sha = data.pull_request?.merge_commit_sha || data.pull_request?.head?.sha || null;
+    } else if (eventType === 'release') {
+        sha = data.release?.target_commitish || null;
+    }
+
+    // Normalize: take short SHA if available (first 7 chars)
+    if (sha && sha.length > 7) sha = sha.slice(0, 7);
+    return sha;
+}
+
+// ---------------------------------------------------------------------------
+// GitHub job status line builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a single status line for a GitHub job event (check_run / workflow_job).
+ * Format: [check_run|workflow] name | failures:N | conclusion:STATUS
+ * Returns null if this envelope doesn't represent a runnable job.
+ */
+function buildGithubJobLine(env) {
+    const extra = env.extra || {};
+    const data = extra.data || {};
+    const eventType = extra.event_type || '';
+
+    let name = '';
+    let failures = 0;
+    let conclusion = '';
+    let status = '';
+    let htmlUrl = '';
+    let startedAt = '';
+    let completedAt = '';
+
+    if (eventType === 'check_run') {
+        const cr = data.check_run || {};
+        name = cr.name || 'check_run';
+        failures = cr.failures_count || 0;
+        conclusion = cr.conclusion || '';
+        status = cr.status || '';
+        htmlUrl = cr.html_url || '';
+        startedAt = cr.started_at || '';
+        completedAt = cr.completed_at || '';
+    } else if (eventType === 'workflow_job') {
+        const wj = data.workflow_job || {};
+        name = wj.name || wj.workflow_name || 'workflow_job';
+        failures = wj.failures_count || 0;
+        conclusion = wj.conclusion || '';
+        status = wj.status || '';
+        htmlUrl = wj.html_url || '';
+        startedAt = wj.started_at || '';
+        completedAt = wj.completed_at || '';
+    } else {
+        return null;
+    }
+
+    // Build the line components
+    const label = eventType === 'check_run' ? 'check_run' : 'workflow';
+    const parts = [`[${ label }] ${ name }`];
+
+    // For check_run: also include commit short SHA and first line of commit msg
+    // (pulled from the check_suite head_commit) so the line is self-contained.
+    if (eventType === 'check_run') {
+        const commit = data.check_run?.check_suite?.head_commit;
+        if (commit) {
+            const shortSha = (commit.id || '').slice(0, 7);
+            const msgFirstLine = (commit.message || '').split('\n')[0];
+            if (shortSha) parts.push(shortSha);
+            if (msgFirstLine) parts.push(msgFirstLine.slice(0, 80));
+        }
+    } else if (eventType === 'workflow_job') {
+        // workflow_job references a workflow_run — pull head SHA from there
+        const wfRun = data.workflow_job?.workflow_run;
+        if (wfRun) {
+            const shortSha = (wfRun.head_sha || '').slice(0, 7);
+            if (shortSha) parts.push(shortSha);
+        }
+    }
+
+    if (status && !conclusion) {
+        parts.push(`status: ${ status }`);
+    }
+    if (failures > 0) {
+        parts.push(`failures: ${ failures }`);
+    }
+    if (conclusion) {
+        parts.push(`conclusion: ${ conclusion }`);
+    }
+
+    // Show elapsed time if started but not completed
+    if (startedAt && !completedAt) {
+        const elapsed = elapsedMs(startedAt);
+        if (elapsed !== null) parts.push(`elapsed: ${ elapsed }`);
+    }
+
+    let line = parts.join(' | ');
+    if (htmlUrl) line += ` (${ htmlUrl })`;
+
+    return line;
+}
+
+/** Return a human-readable duration string from an ISO timestamp, or null. */
+function elapsedMs(isoTimestamp) {
+    if (!isoTimestamp) return null;
+    const diff = Date.now() - new Date(isoTimestamp).getTime();
+    if (isNaN(diff) || diff < 0) return null;
+    const s = Math.floor(diff / 1000);
+    if (s < 60) return `${ s }s`;
+    const m = Math.floor(s / 60);
+    const h = Math.floor(m / 60);
+    if (h > 0) return `${ h }h ${ m % 60 }m`;
+    return `${ m }m ${ s % 60 }s`;
+}
+
+// ---------------------------------------------------------------------------
+// GitHub dedup normalisation
+// ---------------------------------------------------------------------------
+
+/**
+ * For GitHub envelopes that carry a commit SHA but have no dedup_key,
+ * inject one scoped to the commit so that all events for the same commit
+ * are routed to the same trackable message (commit message + job list).
+ *
+ * Also marks env.extra._is_github_job = true so tryEdit can format it
+ * appropriately.
+ */
+function normalizeGithubDedup(it) {
+    const extra = it.env.extra = it.env.extra || {};
+    if (extra.dedup_key) return; // already has one — preserve
+    const sha = extractCommitSha(it.env);
+    if (!sha) return; // no SHA — can't group
+
+    // If this event has no message of its own and isn't a job-status event,
+    // don't group it — it would produce an empty message with no useful context.
+    const hasMessage = !!(it.env.message && String(it.env.message).trim().length > 0);
+    const isJobStatus = !!(extra.event_type === 'check_run' || extra.event_type === 'workflow_job');
+    if (!hasMessage && !isJobStatus) return;
+
+    extra.dedup_key = `github:commit:${ sha }`;
+    extra._commit_sha = sha;
+    extra._is_github_job = isJobStatus;
+}
 
 let stopping = false;
 let tickInFlight = false;
@@ -182,6 +357,10 @@ async function runTick() {
                     await bumpMetric('redirected');
                 }
             }
+            // Auto-group GitHub events by commit SHA: inject a dedup_key so
+            // the first event creates the trackable message and subsequent
+            // job statuses for the same SHA edit it in-place.
+            normalizeGithubDedup(it);
             valid.push(it);
         }
 
@@ -294,14 +473,67 @@ async function tryEdit(room, it, recent, stats) {
 
     let newText, newCard;
     if (it.env.type === 'msg') {
-        const appended = (recent.appended_count || 0) + 1;
-        if (appended <= APPEND_TRAIL_SUMMARY_AFTER) {
-            const ts = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
-            newText = `${ recent.text || '' }\n\n— update at ${ ts } (+${ appended }) —\n${ it.env.message || '' }`;
+        const recentSha = recent.commit_sha || null;
+        const currentSha = it.env.extra && it.env.extra._commit_sha ? it.env.extra._commit_sha : null;
+        const isGithubAppend = recentSha && currentSha && recentSha === currentSha;
+
+        if (isGithubAppend) {
+            // ── GitHub commit append mode ──────────────────────────────────
+            // All events for the same commit SHA should land in one message.
+            // Parse the existing text: header (commit message) + job-list section.
+            // Append the new job to the job-list section.
+            //
+            // Two sub-modes:
+            //   a) Existing text starts with a short-SHA commit line (7 hex chars +
+            //      space) → treat it as a proper commit header, append job below it.
+            //   b) Existing text is a job-status line (no SHA header) → the incoming
+            //      message IS the commit header; replace the header, keep the job list.
+            const existingText = recent.text || '';
+            const JOB_LIST_MARKER = '\n\n— jobs —\n';
+            const COMMIT_SHA_RE = /^[0-9a-f]{7} [^\n]*/;
+            let header = '';
+            let jobList = '';
+
+            const markerPos = existingText.indexOf(JOB_LIST_MARKER);
+            if (markerPos !== -1) {
+                header = existingText.slice(0, markerPos);
+                jobList = existingText.slice(markerPos + JOB_LIST_MARKER.length);
+            } else {
+                // No marker yet.  If the existing text looks like a commit header
+                // (starts with a 7-char hex SHA + space), treat it as the header;
+                // otherwise treat it as a job-only line — the incoming commit message
+                // should become the new header.
+                if (COMMIT_SHA_RE.test(existingText)) {
+                    header = existingText;
+                } else {
+                    // Existing is a job-only message — incoming commit becomes header
+                    header = it.env.message || `[${ it.env.extra.event_type }]`;
+                    jobList = existingText;
+                }
+            }
+
+            const jobLine = buildGithubJobLine(it.env) || it.env.message || `[${ it.env.extra.event_type }]`;
+
+            if (jobList.length === 0) {
+                // First job — initialise the job-list section
+                jobList = jobLine;
+            } else {
+                // Subsequent jobs — append
+                jobList = `${ jobList }\n${ jobLine }`;
+            }
+
+            newText = `${ header }${ JOB_LIST_MARKER }${ jobList }`;
         } else {
-            const ts = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
-            const baseLine = (recent.text || '').split('\n')[0] || '';
-            newText = `${ baseLine }\n\n— ${ appended } updates · last ${ ts } — most recent: ${ it.env.message || '' }`;
+            // ── Standard append mode (non-GitHub or different commit) ──────
+            const appended = (recent.appended_count || 0) + 1;
+            if (appended <= APPEND_TRAIL_SUMMARY_AFTER) {
+                const ts = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
+                newText = `${ recent.text || '' }\n\n— update at ${ ts } (+${ appended }) —\n${ it.env.message || '' }`;
+            } else {
+                const ts = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
+                const baseLine = (recent.text || '').split('\n')[0] || '';
+                newText = `${ baseLine }\n\n— ${ appended } updates · last ${ ts } — most recent: ${ it.env.message || '' }`;
+            }
         }
     } else {
         newCard = Array.isArray(it.env.card) ? it.env.card : [it.env.card];
@@ -332,7 +564,8 @@ async function tryEdit(room, it, recent, stats) {
         type: it.env.type,
         text: newText || recent.text,
         appended_count: (recent.appended_count || 0) + 1,
-        conversationId: recent.conversationId
+        conversationId: recent.conversationId,
+        commit_sha: it.env.extra && it.env.extra._commit_sha ? it.env.extra._commit_sha : (recent.commit_sha || null)
     };
     await saveRecent(room, it.env.extra.dedup_key, updated);
     stats.edited++;
@@ -367,7 +600,8 @@ async function handleSingleNew(room, it, stats) {
                     type: it.env.type,
                     text: it.env.message,
                     appended_count: 0,
-                    conversationId
+                    conversationId,
+                    commit_sha: it.env.extra._commit_sha || null
                 });
             }
             stats.sent++;
@@ -408,7 +642,8 @@ async function handleSingleNew(room, it, stats) {
             type: it.env.type,
             text: it.env.message,
             appended_count: 0,
-            conversationId
+            conversationId,
+            commit_sha: it.env.extra._commit_sha || null
         });
     }
     stats.sent++;

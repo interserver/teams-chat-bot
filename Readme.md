@@ -329,6 +329,16 @@ This release adds a Redis-backed notification queue consumer, a daily recap Adap
 | `RATE_LIMIT_MAX` | `60` | General rate limit max reqs |
 | `RATE_LIMIT_SEND_WINDOW_MS` | `60000` | Send-endpoint rate limit window |
 | `RATE_LIMIT_SEND_MAX` | `30` | Send-endpoint rate limit max reqs |
+| `NOTIF_COMMIT_GROUP_WINDOW_MS` | `180000` (3 min) | GitHub commit grouping window |
+
+**GitHub Commit + Job Grouping**
+- `check_run` and `workflow_job` events are no longer silently dropped — they are passed through to the notification consumer.
+- A `dedup_key` of `github:commit:{sha}` (first 7 chars) is auto-injected for GitHub events that carry a commit SHA and have no pre-existing dedup_key.
+- All events for the same commit SHA are routed to the **same trackable message** within the edit window (30 min).
+- The resulting message has the **commit header** (SHA + first line of commit message) followed by a `— jobs —` section listing each job's name, failures, status/conclusion, elapsed time, and URL.
+- Subsequent job statuses for the same commit **edit** that same message, updating the job's line in-place as it progresses: queued → in_progress → success/failure.
+- If no event for a given SHA arrives within 3 minutes (`NOTIF_COMMIT_GROUP_WINDOW_MS`), the edit-window cache expires and the next event for that SHA starts a fresh message.
+- `check_suite` and `workflow_run` remain silently filtered (they are aggregates; individual job events carry the detail).
 
 **`/health/queue` Endpoint**
 - Returns `{ status, running, queue_depth, processing_depth, dead_depth, poll_interval_ms, edit_window_ms, max_per_tick, last_tick }`

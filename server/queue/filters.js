@@ -31,22 +31,21 @@ function shouldSkip(envelope) {
     // decideSend(). Keeping the logic on the bot side means we can tune
     // verbosity without redeploying the webhook receiver.
     if (eventType) {
+        // check_run and workflow_job are NOT filtered here — they are
+        // passed through to the notification consumer where they are
+        // grouped with their parent commit message via commit-scope
+        // dedup keys (see normalizeGithubDedup in notificationConsumer).
         if (eventType === 'check_run') {
-            return '__SILENT__';
-            //return 'check_run is per-job noise; check_suite is the rollup';
+            return null; // pass through
         }
         if (eventType === 'workflow_job') {
-            return '__SILENT__';
+            return null; // pass through
         }
         if (eventType === 'check_suite') {
-            return '__SILENT__';
-            const c = data.check_suite && data.check_suite.conclusion;
-            if (!c || SUCCESSFUL_CHECK_CONCLUSIONS.has(c)) {
-                return `check_suite conclusion=${ c || 'pending' }`;
-            }
+            return '__SILENT__'; // aggregate — individual check_run events carry the detail
         }
         if (eventType === 'workflow_run') {
-            return '__SILENT__';
+            return '__SILENT__'; // aggregate — individual workflow_job events carry the detail
         }
         if (LOW_SIGNAL_GITHUB_EVENTS.has(eventType)) {
             return `low-signal github event ${ eventType }`;
