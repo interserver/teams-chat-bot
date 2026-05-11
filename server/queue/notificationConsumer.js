@@ -188,24 +188,17 @@ function elapsedMs(isoTimestamp) {
  * inject one scoped to the commit so that all events for the same commit
  * are routed to the same trackable message (commit message + job list).
  *
- * Also marks env.extra._is_github_job = true so tryEdit can format it
- * appropriately.
+ * This means a push creates the trackable message (as the parent commit
+ * notification), and all subsequent check_run / workflow_job events for
+ * that same SHA edit it in-place, appending/updating their job status lines.
  */
 function normalizeGithubDedup(it) {
     const extra = it.env.extra = it.env.extra || {};
     if (extra.dedup_key) return; // already has one — preserve
     const sha = extractCommitSha(it.env);
     if (!sha) return; // no SHA — can't group
-
-    // If this event has no message of its own and isn't a job-status event,
-    // don't group it — it would produce an empty message with no useful context.
-    const hasMessage = !!(it.env.message && String(it.env.message).trim().length > 0);
-    const isJobStatus = !!(extra.event_type === 'check_run' || extra.event_type === 'workflow_job');
-    if (!hasMessage && !isJobStatus) return;
-
     extra.dedup_key = `github:commit:${ sha }`;
     extra._commit_sha = sha;
-    extra._is_github_job = isJobStatus;
 }
 
 let stopping = false;
@@ -479,15 +472,13 @@ async function tryEdit(room, it, recent, stats) {
 
         if (isGithubAppend) {
             // ── GitHub commit append mode ──────────────────────────────────
-            // All events for the same commit SHA should land in one message.
-            // Parse the existing text: header (commit message) + job-list section.
-            // Append the new job to the job-list section.
+            // All events for the same commit SHA land in one trackable message.
+            // Parse existing text as: {header} + "— jobs —" + {existing job list}
             //
-            // Two sub-modes:
-            //   a) Existing text starts with a short-SHA commit line (7 hex chars +
-            //      space) → treat it as a proper commit header, append job below it.
-            //   b) Existing text is a job-status line (no SHA header) → the incoming
-            //      message IS the commit header; replace the header, keep the job list.
+            // New job arrives → append to job list, update message
+            // New commit (push) arrives → replace header only, keep job list
+            //   (so the push replaces the placeholder job-only header with
+            //    the real commit info while preserving CI status)
             const existingText = recent.text || '';
             const JOB_LIST_MARKER = '\n\n— jobs —\n';
             const COMMIT_SHA_RE = /^[0-9a-f]{7} [^\n]*/;
@@ -499,30 +490,39 @@ async function tryEdit(room, it, recent, stats) {
                 header = existingText.slice(0, markerPos);
                 jobList = existingText.slice(markerPos + JOB_LIST_MARKER.length);
             } else {
-                // No marker yet.  If the existing text looks like a commit header
-                // (starts with a 7-char hex SHA + space), treat it as the header;
-                // otherwise treat it as a job-only line — the incoming commit message
-                // should become the new header.
+                // No marker yet.  If existing starts with a 7-char hex SHA it is
+                // a real commit header; otherwise it is a job-only placeholder
+                // (created when a job arrived before the push).  In that case the
+                // incoming commit message becomes the new header.
                 if (COMMIT_SHA_RE.test(existingText)) {
                     header = existingText;
                 } else {
-                    // Existing is a job-only message — incoming commit becomes header
                     header = it.env.message || `[${ it.env.extra.event_type }]`;
                     jobList = existingText;
                 }
             }
 
-            const jobLine = buildGithubJobLine(it.env) || it.env.message || `[${ it.env.extra.event_type }]`;
+            // Determine the new job line to append/update
+            const jobLine = buildGithubJobLine(it.env);
+            const isCommitMessage = !jobLine && it.env.message && String(it.env.message).trim().length > 0;
 
-            if (jobList.length === 0) {
-                // First job — initialise the job-list section
-                jobList = jobLine;
+            if (isCommitMessage) {
+                // ── New commit/push message arrived — replace header, keep job list
+                header = it.env.message || '';
+                newText = header + (jobList ? JOB_LIST_MARKER + jobList : '');
+            } else if (jobLine) {
+                // ── New job status — always append as a new entry (don't update in-place)
+                // This gives a chronological timeline: queued → in_progress → success/failure
+                if (jobList.length === 0) {
+                    jobList = jobLine;
+                } else {
+                    jobList = `${ jobList }\n${ jobLine }`;
+                }
+                newText = `${ header }${ JOB_LIST_MARKER }${ jobList }`;
             } else {
-                // Subsequent jobs — append
-                jobList = `${ jobList }\n${ jobLine }`;
+                // Fallback: just append
+                newText = `${ header }\n\n${ it.env.message || '' }`;
             }
-
-            newText = `${ header }${ JOB_LIST_MARKER }${ jobList }`;
         } else {
             // ── Standard append mode (non-GitHub or different commit) ──────
             const appended = (recent.appended_count || 0) + 1;
