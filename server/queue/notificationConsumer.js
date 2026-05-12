@@ -34,7 +34,157 @@ const COMMIT_GROUP_WINDOW_MS = parseInt(process.env.NOTIF_COMMIT_GROUP_WINDOW_MS
 
 function k(name) { return KEY_PREFIX + name; }
 function recentKey(room) { return k('recent:') + room; }
+function wfactiveKey(repo) { return k('wfactive:') + repo; }
 function metric(name) { return k('metrics:') + name; }
+
+// ---------------------------------------------------------------------------
+// Action-triggered push attribution
+// ---------------------------------------------------------------------------
+//
+// When a workflow on commit X commits + pushes a follow-up (e.g. the VHS
+// workflow that re-renders demo GIFs and pushes "vhs: regenerate demo GIFs"
+// back to master), GitHub fires that as a brand-new `push` event with a brand-
+// new SHA — the webhook does not say "this push was caused by workflow run R
+// on commit X". Without help, the consumer treats it as an unrelated commit
+// and spawns a new trackable.
+//
+// We bridge that gap with two pieces:
+//   1. A per-repo "active workflows" sorted set (`notif:wfactive:{repo}`,
+//      member = parent commit SHA, score = ts), populated whenever a
+//      workflow_run / workflow_job / check_run event arrives. An entry's
+//      presence means "this commit currently has CI in flight".
+//   2. On every push, decide if it was action-triggered (bot pusher, OR repo
+//      lives in the downstream map). If so, look up the most recent active
+//      parent SHA in this repo (or in the upstream repo via the map) and
+//      override `dedup_key` so the merger nests the push under the existing
+//      trackable instead of starting a fresh one.
+//
+// The upstream→downstream map is hardcoded to `detain/sugarcraft → sugarcraft/*`
+// and overridable via NOTIF_DOWNSTREAM_REPOS=upstream:glob,upstream:glob,...
+
+function parseDownstreamMap(spec) {
+    const out = [];
+    const raw = (spec || '').trim();
+    if (!raw) return out;
+    for (const pair of raw.split(',')) {
+        const idx = pair.indexOf(':');
+        if (idx <= 0) continue;
+        const upstream = pair.slice(0, idx).trim();
+        const glob = pair.slice(idx + 1).trim();
+        if (!upstream || !glob) continue;
+        // Convert simple glob to anchored regex: only `*` is meaningful
+        const escaped = glob.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+        out.push({ upstream, pattern: new RegExp('^' + escaped + '$') });
+    }
+    return out;
+}
+
+const DOWNSTREAM_REPOS = parseDownstreamMap(
+    process.env.NOTIF_DOWNSTREAM_REPOS || 'detain/sugarcraft:sugarcraft/*'
+);
+
+const WORKFLOW_EVENT_TYPES = new Set(['workflow_run', 'workflow_job', 'check_run', 'check_suite']);
+const BOT_PUSHER_RE = /^github-actions(\[bot\])?$/i;
+
+/**
+ * Record the parent commit SHA into the per-repo active-workflow index for
+ * any workflow-flavoured event. Idempotent — repeated events for the same
+ * SHA just bump the score so the entry's TTL is effectively refreshed.
+ */
+async function recordActiveWorkflow(env) {
+    const extra = env.extra || {};
+    const eventType = extra.event_type || '';
+    if (!WORKFLOW_EVENT_TYPES.has(eventType)) return;
+    const repo = extra.repo || '';
+    const sha = extra._commit_sha || '';
+    if (!repo || !sha) return;
+    const key = wfactiveKey(repo);
+    const ts = Date.now();
+    const cutoff = ts - EDIT_WINDOW_MS;
+    try {
+        const pipe = redis.pipeline();
+        pipe.zadd(key, ts, sha);
+        pipe.zremrangebyscore(key, 0, cutoff);
+        pipe.expire(key, Math.ceil(EDIT_WINDOW_MS / 1000));
+        await pipe.exec();
+    } catch (err) {
+        console.warn(`[notif] recordActiveWorkflow failed for ${ repo }/${ sha }: ${ err.message }`);
+    }
+}
+
+/** Resolve any upstream repos for a child via the configured map. */
+function upstreamCandidates(repo) {
+    const out = [];
+    for (const { upstream, pattern } of DOWNSTREAM_REPOS) {
+        if (pattern.test(repo)) out.push(upstream);
+    }
+    return out;
+}
+
+/**
+ * Decide whether a push envelope looks action-triggered. Returns true when
+ * the pusher/sender is a bot, the head commit's author email is one of the
+ * known GitHub Actions identities, OR the repo lives under an upstream's
+ * downstream-glob (the only writes there in practice come from CI).
+ */
+function isActionTriggeredPush(env) {
+    const extra = env.extra || {};
+    if (extra.event_type !== 'push') return false;
+    const data = extra.data || {};
+
+    const pusherName = (data.pusher && data.pusher.name) || '';
+    if (BOT_PUSHER_RE.test(pusherName)) return true;
+    const pusherEmail = (data.pusher && data.pusher.email) || '';
+    if (/github-actions(\[bot\])?@/i.test(pusherEmail)) return true;
+
+    const senderLogin = (data.sender && data.sender.login) || '';
+    if (/\[bot\]$/i.test(senderLogin)) return true;
+
+    const commits = Array.isArray(data.commits) ? data.commits : [];
+    const head = commits[commits.length - 1];
+    const headAuthorEmail = (head && head.author && head.author.email) || '';
+    if (/github-actions(\[bot\])?@/i.test(headAuthorEmail)) return true;
+
+    const repo = extra.repo || '';
+    if (repo && upstreamCandidates(repo).length > 0) return true;
+
+    return false;
+}
+
+/**
+ * Find the most recent active-workflow parent SHA that this push should be
+ * attributed to. Searches the push's own repo first (covers in-repo bot
+ * commits like the vhs.yml `commit` job), then any configured upstream repos
+ * (covers downstream syncs like `detain/sugarcraft → sugarcraft/<lib>`).
+ * Returns null when nothing within the window matches.
+ */
+async function findParentSha(env) {
+    const extra = env.extra || {};
+    const repo = extra.repo || '';
+    if (!repo) return null;
+    const ownSha = extra._commit_sha || '';
+    const cutoff = Date.now() - EDIT_WINDOW_MS;
+
+    const candidates = [repo, ...upstreamCandidates(repo)];
+    let best = null;
+    for (const candidate of candidates) {
+        try {
+            const recent = await redis.zrevrangebyscore(
+                wfactiveKey(candidate), '+inf', cutoff,
+                'WITHSCORES', 'LIMIT', 0, 5
+            );
+            for (let i = 0; i < recent.length; i += 2) {
+                const sha = recent[i];
+                const ts = parseFloat(recent[i + 1]);
+                if (!sha || sha === ownSha) continue;
+                if (!best || ts > best.ts) best = { sha, ts, repo: candidate };
+            }
+        } catch (err) {
+            console.warn(`[notif] findParentSha lookup failed for ${ candidate }: ${ err.message }`);
+        }
+    }
+    return best ? best.sha : null;
+}
 
 // ---------------------------------------------------------------------------
 // GitHub commit SHA extraction
@@ -535,9 +685,7 @@ function renderChecksGrouped(checkItems, level, lines, depth = 0) {
         if (allSameStatus) {
             const first = stripped[0];
             lines.push(bulletPrefix(level) + `${ first.emoji } **${ seg }** Check ${ first.statusText }`);
-            for (const s of stripped) {
-                lines.push(bulletPrefix(level + 1) + leafOnly(s));
-            }
+            emitLeafBucket(lines, level + 1, stripped);
             continue;
         }
 
@@ -553,9 +701,7 @@ function renderChecksGrouped(checkItems, level, lines, depth = 0) {
             if (statusGroup.length >= 2) {
                 const first = statusGroup[0];
                 lines.push(bulletPrefix(level + 1) + `${ first.emoji } Check ${ first.statusText }`);
-                for (const s of statusGroup) {
-                    lines.push(bulletPrefix(level + 2) + leafOnly(s));
-                }
+                emitLeafBucket(lines, level + 2, statusGroup);
             } else {
                 lines.push(bulletPrefix(level + 1) + leafInline(statusGroup[0]));
             }
@@ -571,6 +717,41 @@ function leafInline(ci) {
 function leafOnly(ci) {
     const link = ci.urlLink ? ' ' + ci.urlLink : '';
     return `**${ ci.leaf }**${ link }`;
+}
+
+/**
+ * Compact form of a leaf for inline comma-joined lists. Drops the per-link
+ * title attribute and shortens "details" → "d" so a row of 9 leaves on one
+ * line stays scannable rather than turning into a wall of repeated link
+ * markup.
+ */
+function leafCompact(ci) {
+    if (!ci.urlLink) return `**${ ci.leaf }**`;
+    const compactLink = ci.urlLink
+        .replace('[details]', '[d]')
+        .replace(/\s"[^"]*"\)\)$/, '))');
+    return `**${ ci.leaf }** ${ compactLink }`;
+}
+
+// When a status sub-bucket has more than this many same-status leaves, fold
+// them onto a single comma-separated line via `leafCompact` instead of one
+// bullet per leaf. Tuned to keep small groups skimmable while preventing
+// long matrix runs (e.g. 30+ test packages all green) from dominating the
+// trackable.
+const LEAVES_COMPACT_THRESHOLD = 3;
+
+/**
+ * Emit a flat list of leaves either as one bullet per leaf (small bucket)
+ * or as a single comma-joined compact bullet when over the threshold.
+ */
+function emitLeafBucket(lines, level, leaves) {
+    if (leaves.length > LEAVES_COMPACT_THRESHOLD) {
+        lines.push(bulletPrefix(level) + leaves.map(leafCompact).join(', '));
+        return;
+    }
+    for (const leaf of leaves) {
+        lines.push(bulletPrefix(level) + leafOnly(leaf));
+    }
 }
 
 /**
@@ -924,6 +1105,23 @@ async function runTick() {
             // the first event creates the trackable message and subsequent
             // job statuses for the same SHA edit it in-place.
             normalizeGithubDedup(it);
+            // Workflow-flavoured events also seed the per-repo active-workflow
+            // index so a later bot/downstream push can look up its parent.
+            await recordActiveWorkflow(it.env);
+            // Action-triggered child pushes (vhs commit, sync-sugarcraft
+            // subtree pushes, etc.) get re-keyed onto the parent's dedup_key
+            // so they nest under the existing trackable instead of spawning
+            // a new message.
+            if (isActionTriggeredPush(it.env)) {
+                const parentSha = await findParentSha(it.env);
+                if (parentSha && parentSha !== it.env.extra._commit_sha) {
+                    const ownSha = it.env.extra._commit_sha;
+                    it.env.extra._original_commit_sha = ownSha;
+                    it.env.extra._commit_sha = parentSha;
+                    it.env.extra.dedup_key = `github:commit:${ parentSha }`;
+                    console.log(`[notif]   ↳ attributing ${ it.env.extra.repo }@${ ownSha } to parent ${ parentSha } (action-triggered)`);
+                }
+            }
             valid.push(it);
         }
 
@@ -1557,4 +1755,11 @@ async function getHealth() {
     }
 }
 
-module.exports = { startConsumer, stopConsumer, getHealth, runTick, getNotifRedis, mergeGithubTrackable };
+module.exports = {
+    startConsumer, stopConsumer, getHealth, runTick, getNotifRedis,
+    mergeGithubTrackable,
+    // exported for !notif wfactive and tests
+    parseDownstreamMap, isActionTriggeredPush, findParentSha, recordActiveWorkflow,
+    wfactiveKey, DOWNSTREAM_REPOS,
+    EDIT_WINDOW_MS
+};

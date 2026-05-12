@@ -330,6 +330,7 @@ This release adds a Redis-backed notification queue consumer, a daily recap Adap
 | `RATE_LIMIT_SEND_WINDOW_MS` | `60000` | Send-endpoint rate limit window |
 | `RATE_LIMIT_SEND_MAX` | `30` | Send-endpoint rate limit max reqs |
 | `NOTIF_COMMIT_GROUP_WINDOW_MS` | `180000` (3 min) | GitHub commit grouping window |
+| `NOTIF_DOWNSTREAM_REPOS` | `detain/sugarcraft:sugarcraft/*` | Comma-separated `upstream:glob` pairs. Pushes to a repo matching `glob` are treated as action-triggered and attributed to the most recent active-CI parent in `upstream` |
 
 **GitHub Commit + Job Grouping**
 - `check_run` and `workflow_job` events are no longer silently dropped — they are passed through to the notification consumer.
@@ -339,6 +340,12 @@ This release adds a Redis-backed notification queue consumer, a daily recap Adap
 - Subsequent job statuses for the same commit **edit** that same message, updating the job's line in-place as it progresses: queued → in_progress → success/failure.
 - If no event for a given SHA arrives within 3 minutes (`NOTIF_COMMIT_GROUP_WINDOW_MS`), the edit-window cache expires and the next event for that SHA starts a fresh message.
 - `check_suite` and `workflow_run` remain silently filtered (they are aggregates; individual job events carry the detail).
+
+**Action-triggered Push Attribution**
+- Workflow events seed a per-repo active-CI index (`notif:wfactive:{repo}` sorted set, member = parent SHA, score = ts) on every `workflow_run` / `workflow_job` / `check_run` arrival.
+- When a `push` event looks action-triggered — pusher is `github-actions[bot]` / matching `github-actions@`, sender ends in `[bot]`, head commit author is a github-actions identity, OR the repo lives under a `NOTIF_DOWNSTREAM_REPOS` glob — the consumer looks up the most recent active parent SHA (in the same repo first, then in any upstream repo via the map) and rewrites `dedup_key` to that parent's. The push then nests under the existing trackable instead of spawning a new message.
+- Default downstream map is `detain/sugarcraft:sugarcraft/*`, covering both the `vhs.yml` self-commit (bot pusher in same repo) and `sync-sugarcraft.yml` subtree pushes (PAT pusher to downstream repos).
+- `!notif wfactive` shows the current per-repo parents-with-active-CI list and the configured downstream map.
 
 **`/health/queue` Endpoint**
 - Returns `{ status, running, queue_depth, processing_depth, dead_depth, poll_interval_ms, edit_window_ms, max_per_tick, last_tick }`

@@ -14,7 +14,7 @@
 
 const { MessageFactory } = require('botbuilder');
 const { CHANNELS, knownRooms, resolve: resolveChannel } = require('../queue/channels');
-const { getNotifRedis } = require('../queue/notificationConsumer');
+const { getNotifRedis, DOWNSTREAM_REPOS, wfactiveKey, EDIT_WINDOW_MS } = require('../queue/notificationConsumer');
 
 const KEY_PREFIX = process.env.NOTIF_KEY_PREFIX || 'notif:';
 function k(name) { return KEY_PREFIX + name; }
@@ -46,6 +46,8 @@ module.exports = {
                     return await drainDeadCmd(context, notifRedis);
                 case 'seed-room':
                     return await seedRoomCmd(context, botRedis, rest);
+                case 'wfactive':
+                    return await wfactiveCmd(context, notifRedis);
                 case '':
                 case 'help':
                 default:
@@ -167,6 +169,62 @@ async function seedRoomCmd(context, redis, rest) {
     ));
 }
 
+async function wfactiveCmd(context, redis) {
+    // Discover wfactive keys without a `KEYS *` scan (Redis can be configured
+    // to refuse it). The downstream-map enumerates the upstream repos we
+    // expect to track; for everything else, fall back to a SCAN.
+    const seen = new Set();
+    for (const { upstream } of DOWNSTREAM_REPOS) seen.add(upstream);
+    const cursorScan = async () => {
+        const found = new Set();
+        let cursor = '0';
+        const match = wfactiveKey('*');
+        // Cap iterations defensively — wfactive is not expected to grow large.
+        for (let i = 0; i < 50; i++) {
+            const [next, batch] = await redis.scan(cursor, 'MATCH', match, 'COUNT', 200);
+            for (const k_ of batch) {
+                const repo = k_.slice(wfactiveKey('').length);
+                if (repo) found.add(repo);
+            }
+            cursor = next;
+            if (cursor === '0') break;
+        }
+        return found;
+    };
+    try {
+        const scanned = await cursorScan();
+        for (const r of scanned) seen.add(r);
+    } catch (_) { /* SCAN unsupported — fall back to map-only enumeration */ }
+
+    const cutoff = Date.now() - EDIT_WINDOW_MS;
+    const lines = ['**notif active workflows**', '```'];
+    let total = 0;
+    for (const repo of [...seen].sort()) {
+        const entries = await redis.zrevrangebyscore(
+            wfactiveKey(repo), '+inf', cutoff, 'WITHSCORES', 'LIMIT', 0, 10
+        ).catch(() => []);
+        if (!entries.length) continue;
+        lines.push(`${ repo }`);
+        for (let i = 0; i < entries.length; i += 2) {
+            const sha = entries[i];
+            const ts = parseFloat(entries[i + 1]);
+            const ageSec = Math.floor((Date.now() - ts) / 1000);
+            const age = ageSec < 60 ? `${ ageSec }s` : `${ Math.floor(ageSec / 60) }m ${ ageSec % 60 }s`;
+            lines.push(`  ${ sha }  age=${ age }`);
+            total++;
+        }
+    }
+    if (total === 0) lines.push('(no active workflows within edit window)');
+    lines.push('```');
+    if (DOWNSTREAM_REPOS.length) {
+        lines.push('_downstream-repo map:_');
+        for (const { upstream, pattern } of DOWNSTREAM_REPOS) {
+            lines.push(`  \`${ upstream }\` → \`${ pattern.source }\``);
+        }
+    }
+    await context.sendActivity(MessageFactory.text(lines.join('\n')));
+}
+
 async function helpCmd(context) {
     const lines = [
         '**!notif** — notification queue admin',
@@ -175,7 +233,8 @@ async function helpCmd(context) {
         '`!notif rooms`             — list known rooms; ✅ = convref cached, ❌ = bot needs to observe inbound activity first',
         '`!notif test <room> <msg>` — enqueue a probe envelope',
         '`!notif drain-dead`        — re-queue everything in `notif:dead`',
-        '`!notif seed-room <room>`  — show whether the bot has a conversation reference for the given room'
+        '`!notif seed-room <room>`  — show whether the bot has a conversation reference for the given room',
+        '`!notif wfactive`          — show parent commits with active CI per repo (used for action-triggered push attribution)'
     ];
     await context.sendActivity(MessageFactory.text(lines.join('\n')));
 }

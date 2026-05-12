@@ -1,7 +1,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { mergeGithubTrackable } = require('../server/queue/notificationConsumer');
+const { mergeGithubTrackable, parseDownstreamMap, isActionTriggeredPush } = require('../server/queue/notificationConsumer');
 
 // The renderer uses regular Markdown nested bullets (ASCII spaces) when
 // the tree never goes deeper than Teams' single level of native nesting,
@@ -234,6 +234,42 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         assert.ok(r3.text.includes(L2_SHALLOW + '⏳ **honey-flap** Check queued'), 'queued child stays inline with its status');
     });
 
+    it('compacts >3 same-status leaves onto a single comma-joined line', () => {
+        // Mimic the real "PHP 8.3 / Test / candy-*" matrix run where 9
+        // packages all pass — each is a check_run with name
+        // "Test · PHP 8.3 · {pkg}" so they all decompose to the same
+        // ["Test","PHP 8.3"] segments and bucket under one status header.
+        let r = mergeGithubTrackable(emptyRecent(), pushEnv());
+        const pkgs = ['candy-vt', 'candy-mines', 'sugar-skate', 'sugar-prompt', 'candy-kit', 'candy-metrics', 'sugar-stash', 'honey-bounce', 'sugar-crumbs'];
+        for (const p of pkgs) {
+            r = mergeGithubTrackable(r, checkRunEnv(`Test · PHP 8.3 · ${ p }`, 'completed', 'success', '✅ stub', `https://example/cr/${ p }`));
+        }
+        // Hierarchy: outer `Test` group → inner `PHP 8.3` rolls status into
+        // its header (single-status sub-bucket), then compact leaf line.
+        assert.ok(r.text.includes('- **Test**'), 'outer Test header rendered');
+        assert.ok(r.text.includes('✅ **PHP 8.3** Check success'), 'inner PHP 8.3 status header rendered');
+
+        // The 9 leaves should appear on ONE line, joined with ", ", using
+        // compact `[d](url)` link form (no per-link title attribute).
+        const compactLine = r.text.split('\n').find(l => l.includes('**candy-vt**') && l.includes('**sugar-crumbs**'));
+        assert.ok(compactLine, 'compact line contains both first and last leaf');
+        assert.equal((compactLine.match(/\*\*[a-z-]+\*\*/g) || []).length, pkgs.length, 'every leaf appears as a bold name');
+        assert.ok(compactLine.includes(', '), 'leaves joined with comma');
+        assert.ok(compactLine.includes('[d]('), 'short [d] link text used');
+        assert.ok(!/\[d\]\([^)]*"[^"]*"\)/.test(compactLine), 'no per-link title attribute in compact form');
+    });
+
+    it('keeps small same-status leaf buckets (≤3) as one bullet per leaf', () => {
+        let r = mergeGithubTrackable(emptyRecent(), pushEnv());
+        for (const p of ['candy-vt', 'candy-mines', 'sugar-skate']) {
+            r = mergeGithubTrackable(r, checkRunEnv(`Test · PHP 8.3 · ${ p }`, 'completed', 'success', '✅ stub', `https://example/cr/${ p }`));
+        }
+        // 3 leaves stays per-bullet — no comma-joined line spanning them
+        const joined = r.text.split('\n').find(l => l.includes('**candy-vt**') && l.includes('**sugar-skate**'));
+        assert.equal(joined, undefined, 'three leaves do not collapse onto one line');
+        assert.ok(r.text.split('\n').some(l => l.trim().startsWith('- **candy-vt**')), 'candy-vt rendered on its own bullet');
+    });
+
     it('sub-groups by status only when 2+ siblings share that status', () => {
         // 2 success + 1 queued under "render". The two successes share a
         // status row; the queued lone-wolf stays inline beside it.
@@ -284,5 +320,75 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         assert.ok(r3.text.startsWith(CHECK_RUN_MSG));
         assert.ok(topBullets.some(l => l.includes('pushed')));
         assert.ok(topBullets.some(l => l.includes('status')));
+    });
+});
+
+describe('parseDownstreamMap', () => {
+    it('returns [] for empty/missing spec', () => {
+        assert.deepEqual(parseDownstreamMap(''), []);
+        assert.deepEqual(parseDownstreamMap(undefined), []);
+    });
+    it('parses single upstream:glob pair', () => {
+        const map = parseDownstreamMap('detain/sugarcraft:sugarcraft/*');
+        assert.equal(map.length, 1);
+        assert.equal(map[0].upstream, 'detain/sugarcraft');
+        assert.ok(map[0].pattern.test('sugarcraft/candy-core'));
+        assert.ok(map[0].pattern.test('sugarcraft/honey-bounce'));
+        assert.ok(!map[0].pattern.test('detain/sugarcraft'));
+        assert.ok(!map[0].pattern.test('other/sugarcraft-thing'));
+    });
+    it('parses multiple comma-separated pairs', () => {
+        const map = parseDownstreamMap('a/b:c/*,d/e:f/g');
+        assert.equal(map.length, 2);
+        assert.ok(map[0].pattern.test('c/anything'));
+        assert.ok(map[1].pattern.test('f/g'));
+        assert.ok(!map[1].pattern.test('f/gh'));
+    });
+    it('escapes regex metacharacters in glob (only * is wildcard)', () => {
+        const map = parseDownstreamMap('a/b:foo.bar/*');
+        assert.ok(map[0].pattern.test('foo.bar/x'));
+        assert.ok(!map[0].pattern.test('fooXbar/x'));
+    });
+});
+
+describe('isActionTriggeredPush', () => {
+    function pushEvent({ pusherName = 'detain', pusherEmail = 'detain@interserver.net', senderLogin = 'detain', repo = 'detain/sugarcraft', commitAuthorEmail = 'detain@interserver.net' } = {}) {
+        return {
+            extra: {
+                event_type: 'push',
+                repo,
+                data: {
+                    pusher: { name: pusherName, email: pusherEmail },
+                    sender: { login: senderLogin },
+                    commits: [{ author: { email: commitAuthorEmail, name: 'Joe' } }]
+                }
+            }
+        };
+    }
+
+    it('returns false for a normal user push to an upstream repo', () => {
+        assert.equal(isActionTriggeredPush(pushEvent()), false);
+    });
+    it('returns true for a push by github-actions[bot]', () => {
+        assert.equal(isActionTriggeredPush(pushEvent({ pusherName: 'github-actions[bot]' })), true);
+    });
+    it('returns true for a push by bare github-actions pusher', () => {
+        assert.equal(isActionTriggeredPush(pushEvent({ pusherName: 'github-actions' })), true);
+    });
+    it('returns true when commit author email is a github-actions identity', () => {
+        assert.equal(isActionTriggeredPush(pushEvent({ commitAuthorEmail: '41898282+github-actions[bot]@users.noreply.github.com' })), true);
+    });
+    it('returns true when sender login ends in [bot]', () => {
+        assert.equal(isActionTriggeredPush(pushEvent({ senderLogin: 'dependabot[bot]' })), true);
+    });
+    it('returns true for a push to any repo in a downstream glob (default map)', () => {
+        // Default map: detain/sugarcraft → sugarcraft/*
+        assert.equal(isActionTriggeredPush(pushEvent({ repo: 'sugarcraft/candy-core' })), true);
+        assert.equal(isActionTriggeredPush(pushEvent({ repo: 'sugarcraft/honey-bounce' })), true);
+    });
+    it('returns false for non-push events even when sender is a bot', () => {
+        const env = pushEvent({ pusherName: 'github-actions[bot]' });
+        env.extra.event_type = 'check_run';
+        assert.equal(isActionTriggeredPush(env), false);
     });
 });
