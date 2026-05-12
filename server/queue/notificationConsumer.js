@@ -1101,6 +1101,19 @@ async function runTick() {
                     await bumpMetric('redirected');
                 }
             }
+            // Route specific repos to int-dev-announce. This is in addition
+            // to (and takes precedence over) the filter-based redirect.
+            const announceRepos = (process.env.NOTIF_ANNOUNCE_REPOS || '')
+                .split(',')
+                .map(s => s.trim())
+                .filter(Boolean);
+            if (announceRepos.includes(it.env.extra?.repo || '')) {
+                const originalRoom = it.env.room || 'unknown';
+                it.env.room = 'int-dev-announce';
+                if (!it.env.extra) it.env.extra = {};
+                it.env.extra.announce_redirect = true;
+                it.env.extra.original_room = originalRoom;
+            }
             // Auto-group GitHub events by commit SHA: inject a dedup_key so
             // the first event creates the trackable message and subsequent
             // job statuses for the same SHA edit it in-place.
@@ -1194,6 +1207,10 @@ async function processRoom(room, batch, stats) {
     }
 
     // 1. Trackable items: try to edit existing recent activity, else new send.
+    // Calls are awaited sequentially so when several events for the same
+    // dedup_key arrive in one batch, the first call's handleSingleNew saves
+    // to Redis before the next call's handleTrackable looks it up — no
+    // grouping work needs to happen here.
     for (const it of trackable) {
         await handleTrackable(room, it, stats);
     }
