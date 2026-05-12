@@ -61,13 +61,28 @@ function extractCommitSha(env) {
             || data.workflow_run?.head_sha
             || null;
     } else if (eventType === 'push') {
-        // commits[0].id is the "after" SHA for a push event
-        sha = data.commits?.[0]?.id || data.after || null;
+        // For a push, `after` is the HEAD SHA after the push and is what the
+        // build/check_run will reference. `commits[0]` is the OLDEST commit
+        // in the push (commits are in chronological order), so reading it
+        // would produce a SHA that no downstream event references.
+        const commitsArr = Array.isArray(data.commits) ? data.commits : [];
+        sha = data.after
+            || data.head_commit?.id
+            || commitsArr[commitsArr.length - 1]?.id
+            || commitsArr[0]?.id
+            || null;
+    } else if (eventType === 'status') {
+        sha = data.sha || null;
     } else if (eventType === 'commit_comment') {
         sha = data.comment?.commit_id || null;
     } else if (eventType === 'pull_request') {
-        // Use the merge commit SHA (head SHA) if available
         sha = data.pull_request?.merge_commit_sha || data.pull_request?.head?.sha || null;
+    } else if (eventType === 'pull_request_review') {
+        // PR reviews are anchored to the commit being reviewed (review.commit_id)
+        // and fall back to the PR's current HEAD sha.
+        sha = data.review?.commit_id || data.pull_request?.head?.sha || null;
+    } else if (eventType === 'pull_request_review_comment') {
+        sha = data.comment?.commit_id || data.pull_request?.head?.sha || null;
     } else if (eventType === 'release') {
         sha = data.release?.target_commitish || null;
     }
@@ -183,11 +198,15 @@ function normalizeGithubDedup(it) {
 
     extra._commit_sha = sha;
 
-    // For push, workflow_job, check_run, check_suite, workflow_run:
-    // ensure dedup_key is commit-based so all events for same commit group together
+    // For events that carry a commit SHA we always force the dedup key to
+    // be commit-scoped so that pushes, workflow events, status events and
+    // PR-review events for the same commit all merge into one trackable
+    // message. PHP-set dedup keys are intentionally overridden.
     if (eventType === 'push' || eventType === 'workflow_job' ||
         eventType === 'check_run' || eventType === 'check_suite' ||
-        eventType === 'workflow_run') {
+        eventType === 'workflow_run' || eventType === 'status' ||
+        eventType === 'pull_request' || eventType === 'pull_request_review' ||
+        eventType === 'pull_request_review_comment' || eventType === 'commit_comment') {
         extra.dedup_key = `github:commit:${ sha }`;
         return;
     }
@@ -202,93 +221,281 @@ function normalizeGithubDedup(it) {
 // ---------------------------------------------------------------------------
 // GitHub trackable message merger (pure)
 // ---------------------------------------------------------------------------
-
-const JOB_LIST_MARKER = '\n\n— jobs —\n';
-// Short-SHA-prefixed commit header (e.g. "4fd48e4 fix bug").
-const COMMIT_SHA_RE = /^[0-9a-f]{7} [^\n]*/;
-// Emoji that indicate a commit/push header line (not a job status).
-const COMMIT_HEADER_EMOJI_RE = /^📦/u;
-// Emoji that indicate job status lines. The `u` flag is required so the
-// character class matches full code points; without it, 📦 (D83D DCE6)
-// would falsely match because it shares the D83D high surrogate with 🔄
-// (D83D DD04), and the regex engine treats each surrogate half as a
-// separate code unit. That collision is what produced the
-// "push + — jobs — + push" duplication bug.
-const JOB_EMOJI_RE = /^[⏳🔄✅❌⏭️⚠️ℹ️❓]/u;
+//
+// Format: the first event for a commit SHA becomes the header. Every later
+// event for the same SHA becomes a nested bullet ` - ` under the header.
+// Push events keep their commit list as ` - ` sub-bullets indented one level
+// deeper. Job events (check_run / workflow_job) carry an identity derived
+// from event_type+name so that queued → in_progress → success edits one
+// bullet rather than appending three.
 
 /**
- * Merge a new envelope into an existing trackable message text for the same
- * commit SHA. Pure: returns the new message text. Inputs:
- *   existingText — recent.text (whatever was last sent for this dedup_key)
- *   env          — the incoming envelope (env.message, env.extra.event_type)
- *
- * The output is parsed as `{header}{JOB_LIST_MARKER}{jobList}` on the next
- * call. New push → replaces header, preserves jobList. New job event →
- * inserts/updates that job's line in jobList. Unknown event → appended.
+ * Identity for events whose successive states should overwrite the same
+ * bullet (or the header, if the header was set by that identity). Returns
+ * null for events that should just append on each occurrence.
  */
-function mergeGithubTrackable(existingText, env) {
+function jobIdentity(env) {
     const extra = env.extra || {};
-    let header = '';
-    let jobList = '';
-
-    const trimmedExisting = existingText.trim();
-    const markerPos = existingText.indexOf(JOB_LIST_MARKER);
-    if (markerPos !== -1) {
-        header = existingText.slice(0, markerPos);
-        jobList = existingText.slice(markerPos + JOB_LIST_MARKER.length);
-    } else if (COMMIT_SHA_RE.test(existingText) || COMMIT_HEADER_EMOJI_RE.test(trimmedExisting)) {
-        // Existing is a commit header (either short SHA prefix or a 📦 push
-        // message). Preserve as header; no jobs yet.
-        header = existingText;
-    } else if (JOB_EMOJI_RE.test(trimmedExisting)) {
-        // Existing is a job-only placeholder (a job event arrived before the
-        // push). Incoming push becomes the new header, existing job line
-        // moves into the job list.
-        header = env.message || `[${ extra.event_type }]`;
-        jobList = existingText;
-    } else {
-        // Unknown format — preserve existing text as the header and leave
-        // jobList empty. The isCommitMessage / jobLine branches decide what
-        // to do with the incoming envelope; we must NOT preemptively stuff
-        // the incoming text into jobList, or a duplicate push will surface
-        // as `header + — jobs — + header`.
-        header = existingText;
-    }
-
-    const jobLine = buildGithubJobLine(env);
+    const data = extra.data || {};
     const eventType = extra.event_type || '';
-    const isPushEvent = (eventType === 'push');
-    // isCommitMessage is true ONLY for push events with no job line.
-    const isCommitMessage = isPushEvent && !jobLine && env.message && String(env.message).trim().length > 0;
+    if (eventType === 'check_run') {
+        const name = data.check_run?.name;
+        return name ? `check_run:${ name }` : null;
+    }
+    if (eventType === 'workflow_job') {
+        // Multiple jobs in the same workflow share `workflow_name`. The
+        // displayed message uses workflow_name (not the per-job name), so
+        // keying identity by workflow_name collapses jobs of the same
+        // workflow to one bullet rather than producing N identical lines.
+        const wj = data.workflow_job || {};
+        const name = wj.workflow_name || wj.name;
+        return name ? `workflow_job:${ name }` : null;
+    }
+    if (eventType === 'workflow_run') {
+        const wr = data.workflow_run || {};
+        const name = wr.name;
+        return name ? `workflow_run:${ name }` : null;
+    }
+    if (eventType === 'status') {
+        // Status events from a CI bot identify themselves by `context`
+        // (e.g. "continuous-integration/appveyor/branch"). Coalesce by it
+        // so queued / pending / success states for the same CI bot share
+        // one bullet rather than spawning new ones.
+        const context = data.context;
+        return context ? `status:${ context }` : 'status:unknown';
+    }
+    if (eventType === 'pull_request_review') {
+        // Each review has its own id — distinct reviews should be distinct
+        // bullets, but if the same review is later edited the same id
+        // appears again and updates in place.
+        const id = data.review?.id;
+        return id ? `pr_review:${ id }` : null;
+    }
+    if (eventType === 'pull_request_review_comment') {
+        const id = data.comment?.id;
+        return id ? `pr_review_comment:${ id }` : null;
+    }
+    if (eventType === 'commit_comment') {
+        const id = data.comment?.id;
+        return id ? `commit_comment:${ id }` : null;
+    }
+    return null;
+}
 
-    if (isCommitMessage) {
-        header = env.message || '';
-        return header + (jobList ? JOB_LIST_MARKER + jobList : '');
-    }
-    if (jobLine) {
-        // Insert or replace the line for this job by name match.
-        const jobNameMatch = jobLine.match(/^[^\s]+\s+(.+?)(?:\s|$)/);
-        const incomingJobName = jobNameMatch ? jobNameMatch[1].trim() : '';
-        if (jobList.length === 0) {
-            jobList = jobLine;
-        } else {
-            const lines = jobList.split('\n');
-            let replaced = false;
-            const newLines = lines.map(line => {
-                const existingNameMatch = line.match(/^[^\s]+\s+(.+?)(?:\s|$)/);
-                const existingJobName = existingNameMatch ? existingNameMatch[1].trim() : '';
-                if (existingJobName === incomingJobName) {
-                    replaced = true;
-                    return jobLine;
-                }
-                return line;
-            });
-            jobList = replaced ? newLines.join('\n') : `${ jobList }\n${ jobLine }`;
+/**
+ * Pick the emoji + status-text for a check_run / workflow_job conclusion or
+ * in-flight status. Mirrors the table in `buildGithubJobLine` so verbose
+ * (env.message) and condensed (condensedBulletText) renderings stay
+ * consistent.
+ */
+function pickStatusEmoji(conclusion, status) {
+    if (conclusion) {
+        switch (conclusion) {
+        case 'success': return { emoji: '✅', statusText: 'success' };
+        case 'failure': return { emoji: '❌', statusText: 'failure' };
+        case 'skipped': return { emoji: '⏭️', statusText: 'skipped' };
+        case 'cancelled': return { emoji: '⚠️', statusText: 'cancelled' };
+        case 'neutral': return { emoji: 'ℹ️', statusText: 'neutral' };
+        default: return { emoji: '❓', statusText: String(conclusion) };
         }
-        return `${ header }${ JOB_LIST_MARKER }${ jobList }`;
     }
-    // Fallback: just append the incoming text.
-    return `${ header }\n\n${ env.message || '' }`;
+    if (status) {
+        switch (status) {
+        case 'queued': return { emoji: '⏳', statusText: 'queued' };
+        case 'in_progress': return { emoji: '🔄', statusText: 'in_progress' };
+        case 'waiting': return { emoji: '⏸️', statusText: 'waiting' };
+        case 'completed': return { emoji: '✅', statusText: 'completed' };
+        default: return { emoji: '❓', statusText: String(status) };
+        }
+    }
+    return { emoji: '', statusText: '' };
+}
+
+/**
+ * Build a compact bullet line for a known GitHub event. The aim is to drop
+ * the repository link and branch suffix from the PHP-generated env.message
+ * (the parent push header already carries that context) so that bullets
+ * stay scannable. Returns null when the event type has no condensed form,
+ * letting the caller fall back to env.message.
+ */
+function condensedBulletText(env) {
+    const extra = env.extra || {};
+    const data = extra.data || {};
+    const eventType = extra.event_type || '';
+
+    if (eventType === 'check_run') {
+        const cr = data.check_run || {};
+        const name = cr.name;
+        const { emoji, statusText } = pickStatusEmoji(cr.conclusion, cr.status);
+        if (!name || !statusText) return null;
+        const url = cr.html_url || cr.details_url || '';
+        const link = url ? ` ([details](${ url } "${ url }"))` : '';
+        return `${ emoji } **${ name }** Check ${ statusText }${ link }`;
+    }
+    if (eventType === 'workflow_job') {
+        const wj = data.workflow_job || {};
+        const name = wj.workflow_name || wj.name;
+        const { emoji, statusText } = pickStatusEmoji(wj.conclusion, wj.status);
+        if (!name || !statusText) return null;
+        const url = wj.html_url || '';
+        const link = url ? ` ([view run](${ url } "${ url }"))` : '';
+        return `${ emoji } **${ name }** Workflow ${ statusText }${ link }`;
+    }
+    return null;
+}
+
+/**
+ * Render an event's `message` as a nested bullet. The first non-empty line
+ * gets ` - <text>` (top-level bullet). Embedded bullet markers `•`, `*`, or
+ * `-` are promoted to `  - <text>` (one indent deeper). Other continuation
+ * lines align under the text that follows the dash.
+ */
+function indentAsBullet(messageText) {
+    const lines = String(messageText || '')
+        .replace(/\r\n/g, '\n')
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l.length > 0);
+    if (lines.length === 0) return ' - ';
+    const out = [];
+    let firstHandled = false;
+    for (const line of lines) {
+        const m = line.match(/^[•*\-]\s+(.+)/);
+        if (m) {
+            out.push('  - ' + m[1]);
+        } else if (!firstHandled) {
+            out.push(' - ' + line);
+            firstHandled = true;
+        } else {
+            out.push('   ' + line);
+        }
+    }
+    return out.join('\n');
+}
+
+function renderTrackable(header, items) {
+    const headerText = String(header || '').trim();
+    const bullets = items.map(it => indentAsBullet(it.text)).filter(b => b.length > 0);
+    if (bullets.length === 0) return headerText;
+    return headerText + '\n' + bullets.join('\n');
+}
+
+/**
+ * Split an incoming env.message into a header line plus any leading bullet
+ * items it already contains. Bullet markers `•`, `*`, and `-` (with at
+ * least one trailing space) are recognised. Used when seeding a brand-new
+ * trackable so a push's commit-list lines become top-level bullets at the
+ * same indent as later check_run/workflow_job bullets, instead of staying
+ * stuck inside the verbose header as raw `•` lines.
+ */
+function splitHeaderAndBullets(text) {
+    const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+    const headerLines = [];
+    const bulletItems = [];
+    let bulletsStarted = false;
+    for (const raw of lines) {
+        const trimmed = raw.trim();
+        if (!trimmed) continue; // collapse blank lines
+        const m = trimmed.match(/^[•*\-]\s+(.+)/);
+        if (m) {
+            bulletsStarted = true;
+            bulletItems.push({ identity: null, text: m[1] });
+        } else if (bulletsStarted) {
+            // Trailing prose after a bullet list — keep it as another item
+            // rather than tacking it back onto the header (which would
+            // re-introduce a multi-paragraph header).
+            bulletItems.push({ identity: null, text: trimmed });
+        } else {
+            headerLines.push(raw);
+        }
+    }
+    return { headerText: headerLines.join('\n').trim(), bulletItems };
+}
+
+/**
+ * Merge an incoming envelope into an existing trackable message.
+ *
+ *   recent — either the full recent object (with `header`, `items`,
+ *            `header_identity`) or a legacy plain text string. The string
+ *            form is preserved for backward compat (it is treated as the
+ *            header with no prior items).
+ *   env    — the incoming envelope.
+ *
+ * Returns `{ text, header, items, header_identity }`. Callers persist the
+ * full object so the structure survives across edits.
+ */
+function mergeGithubTrackable(recent, env) {
+    const recentObj = typeof recent === 'string'
+        ? { header: recent, items: [], header_identity: null }
+        : (recent || { header: '', items: [], header_identity: null });
+
+    // Header keeps the verbose PHP-generated message so the trackable
+    // carries repo + branch context up top. Bullets prefer a condensed
+    // rendering so identical workflow-level lines don't clutter the
+    // message — fall back to env.message when there is no condensed form.
+    const verboseMessage = String(env.message || '').trim();
+    const condensed = condensedBulletText(env);
+    const bulletMessage = condensed || verboseMessage;
+    const headerMessage = verboseMessage || condensed;
+    const incomingIdentity = jobIdentity(env);
+
+    let header = recentObj.header || recentObj.text || '';
+    let items = Array.isArray(recentObj.items) ? recentObj.items.map(it => ({ ...it })) : [];
+    let headerIdentity = recentObj.header_identity || null;
+
+    // First event for this commit becomes the header. If the verbose
+    // message already contains its own bullet list (push events emit one
+    // line per commit), split those out as initial items so they render at
+    // the same indent as later check_run / workflow_job bullets.
+    if (!header) {
+        if (headerMessage) {
+            const split = splitHeaderAndBullets(headerMessage);
+            header = split.headerText;
+            items = split.bulletItems;
+            headerIdentity = incomingIdentity;
+        }
+        return { text: renderTrackable(header, items), header, items, header_identity: headerIdentity };
+    }
+
+    // Nothing usable to add — emit current state.
+    if (!bulletMessage) {
+        return { text: renderTrackable(header, items), header, items, header_identity: headerIdentity };
+    }
+
+    // Same identity as the header → in-place update of the header (e.g.
+    // check_run "Excavate" queued → in_progress → success edits the header
+    // rather than appending a new bullet for each transition).
+    if (incomingIdentity && headerIdentity && incomingIdentity === headerIdentity) {
+        if (headerMessage) header = headerMessage;
+        return { text: renderTrackable(header, items), header, items, header_identity: headerIdentity };
+    }
+
+    // Re-delivery of the same event (no identity, header text already
+    // matches the incoming message's leading line). For multi-line events
+    // like push we compare against the header-only portion so that
+    // bullet-list lines below it aren't appended again.
+    if (!incomingIdentity) {
+        const incomingSplit = splitHeaderAndBullets(bulletMessage);
+        if (incomingSplit.headerText && incomingSplit.headerText === header.trim()) {
+            return { text: renderTrackable(header, items), header, items, header_identity: headerIdentity };
+        }
+    }
+
+    if (incomingIdentity) {
+        const idx = items.findIndex(it => it.identity === incomingIdentity);
+        if (idx >= 0) {
+            items[idx] = { identity: incomingIdentity, text: bulletMessage };
+        } else {
+            items.push({ identity: incomingIdentity, text: bulletMessage });
+        }
+    } else {
+        // No identity — append unless the same text is already present
+        // (defensive guard against accidental re-delivery from the queue).
+        const already = items.some(it => it.text === bulletMessage);
+        if (!already) items.push({ identity: null, text: bulletMessage });
+    }
+
+    return { text: renderTrackable(header, items), header, items, header_identity: headerIdentity };
 }
 
 let stopping = false;
@@ -573,13 +780,20 @@ async function tryEdit(room, it, recent, stats) {
     console.log(`[notif] ✎ edit room=${ room } conv=${ shortConv(recent.conversationId) } activity=${ recent.activityId } dedup=${ it.env.extra.dedup_key } "${ preview(it.env.message) }"`);
 
     let newText, newCard;
+    let newHeader = recent.header || null;
+    let newItems = Array.isArray(recent.items) ? recent.items : null;
+    let newHeaderIdentity = recent.header_identity || null;
     if (it.env.type === 'msg') {
         const recentSha = recent.commit_sha || null;
         const currentSha = it.env.extra && it.env.extra._commit_sha ? it.env.extra._commit_sha : null;
         const isGithubAppend = recentSha && currentSha && recentSha === currentSha;
 
         if (isGithubAppend) {
-            newText = mergeGithubTrackable(recent.text || '', it.env);
+            const merged = mergeGithubTrackable(recent, it.env);
+            newText = merged.text;
+            newHeader = merged.header;
+            newItems = merged.items;
+            newHeaderIdentity = merged.header_identity;
         } else {
             // ── Standard append mode (non-GitHub or different commit) ──────
             const appended = (recent.appended_count || 0) + 1;
@@ -620,6 +834,9 @@ async function tryEdit(room, it, recent, stats) {
         ts: Date.now(),
         type: it.env.type,
         text: newText || recent.text,
+        header: newHeader,
+        items: newItems,
+        header_identity: newHeaderIdentity,
         appended_count: (recent.appended_count || 0) + 1,
         conversationId: recent.conversationId,
         commit_sha: it.env.extra && it.env.extra._commit_sha ? it.env.extra._commit_sha : (recent.commit_sha || null)
@@ -656,6 +873,9 @@ async function handleSingleNew(room, it, stats) {
                     ts: Date.now(),
                     type: it.env.type,
                     text: it.env.message,
+                    header: it.env.type === 'msg' ? (it.env.message || '') : '',
+                    items: [],
+                    header_identity: it.env.type === 'msg' ? jobIdentity(it.env) : null,
                     appended_count: 0,
                     conversationId,
                     commit_sha: it.env.extra._commit_sha || null
@@ -698,6 +918,9 @@ async function handleSingleNew(room, it, stats) {
             ts: Date.now(),
             type: it.env.type,
             text: it.env.message,
+            header: it.env.type === 'msg' ? (it.env.message || '') : '',
+            items: [],
+            header_identity: it.env.type === 'msg' ? jobIdentity(it.env) : null,
             appended_count: 0,
             conversationId,
             commit_sha: it.env.extra._commit_sha || null
