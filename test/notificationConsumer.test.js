@@ -3,12 +3,16 @@ const assert = require('node:assert/strict');
 
 const { mergeGithubTrackable } = require('../server/queue/notificationConsumer');
 
-// Teams collapses Markdown nested bullets past level 1, so the renderer
-// uses NBSP-indented literal `- ` text for levels 2+. Tests reference these
-// prefix strings directly to keep assertions readable.
+// The renderer uses regular Markdown nested bullets (ASCII spaces) when
+// the tree never goes deeper than Teams' single level of native nesting,
+// and switches to NBSP-indented literal `- ` text only when there are 3+
+// levels (which Teams' Markdown would collapse). Tests reference whichever
+// prefix matches the scenario being verified.
+const NBSP = ' ';
 const L1 = '- ';
-const L2 = '  - ';
-const L3 = '    - ';
+const L2_SHALLOW = '  - ';
+const L2_DEEP = NBSP.repeat(2) + '- ';
+const L3_DEEP = NBSP.repeat(4) + '- ';
 
 const PUSH_MSG = '📦 Joe Huss pushed 1 commit to interserver/teams-chat-bot main (compare)\n• 4fd48e4 updates to the message grouping logic (~1 files)';
 const CHECK_RUN_MSG = '⏳ Check **Excavate** in_progress for detain/scoop-emulators on `master` (details)';
@@ -176,7 +180,7 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         const r = mergeGithubTrackable(legacyRecent, pushEnv());
         assert.equal(r.items.length, 0, 'legacy unsplit re-delivery must not append');
         assert.ok(!r.text.includes(L1 + '📦'), 'no nested push line should appear');
-        assert.ok(!r.text.includes(L2 + '4fd48e4'), 'no doubly-indented commit sub-bullet should appear');
+        assert.ok(!r.text.includes(L2_SHALLOW + '4fd48e4'), 'no doubly-indented commit sub-bullet should appear');
     });
 
     it('accepts a legacy string for `recent` and treats it as the existing header', () => {
@@ -213,9 +217,9 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         const r2 = mergeGithubTrackable(r1, checkRunEnv('render (candy-vcr)', 'completed', 'success'));
         const r3 = mergeGithubTrackable(r2, checkRunEnv('render (candy-mold)', 'completed', 'success'));
         assert.ok(r3.text.includes(L1 + '✅ **render** Check success'), 'shared status combined into prefix header');
-        assert.ok(r3.text.includes(L2 + '**candy-vcr**'), 'candy-vcr leaf with bare name');
-        assert.ok(r3.text.includes(L2 + '**candy-mold**'), 'candy-mold leaf with bare name');
-        assert.ok(!r3.text.includes(L2 + '✅ **candy-vcr** Check'), 'leaves do not re-state the status');
+        assert.ok(r3.text.includes(L2_SHALLOW + '**candy-vcr**'), 'candy-vcr leaf with bare name');
+        assert.ok(r3.text.includes(L2_SHALLOW + '**candy-mold**'), 'candy-mold leaf with bare name');
+        assert.ok(!r3.text.includes(L2_SHALLOW + '✅ **candy-vcr** Check'), 'leaves do not re-state the status');
     });
 
     it('renders a prefix-only header when siblings have mixed statuses', () => {
@@ -224,8 +228,8 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         const r3 = mergeGithubTrackable(r2, checkRunEnv('render (honey-flap)', 'queued', ''));
         assert.ok(r3.text.includes(L1 + '**render**'), 'mixed statuses → prefix-only header');
         assert.ok(!r3.text.includes(L1 + '✅ **render**'), 'no shared status emoji on prefix when statuses differ');
-        assert.ok(r3.text.includes(L2 + '✅ **candy-vcr** Check success'), 'success child stays inline with its status');
-        assert.ok(r3.text.includes(L2 + '⏳ **honey-flap** Check queued'), 'queued child stays inline with its status');
+        assert.ok(r3.text.includes(L2_SHALLOW + '✅ **candy-vcr** Check success'), 'success child stays inline with its status');
+        assert.ok(r3.text.includes(L2_SHALLOW + '⏳ **honey-flap** Check queued'), 'queued child stays inline with its status');
     });
 
     it('sub-groups by status only when 2+ siblings share that status', () => {
@@ -237,10 +241,10 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         const r4 = mergeGithubTrackable(r3, checkRunEnv('render (honey-flap)', 'queued', ''));
 
         assert.ok(r4.text.includes(L1 + '**render**'), 'prefix-only header (mixed statuses)');
-        assert.ok(r4.text.includes(L2 + '✅ Check success'), 'success sub-header without prefix');
-        assert.ok(r4.text.includes(L3 + '**candy-vcr**'), 'candy-vcr nested under success row');
-        assert.ok(r4.text.includes(L3 + '**candy-mold**'), 'candy-mold nested under success row');
-        assert.ok(r4.text.includes(L2 + '⏳ **honey-flap** Check queued'), 'lone queued stays inline');
+        assert.ok(r4.text.includes(L2_DEEP + '✅ Check success'), 'success sub-header without prefix');
+        assert.ok(r4.text.includes(L3_DEEP + '**candy-vcr**'), 'candy-vcr nested under success row');
+        assert.ok(r4.text.includes(L3_DEEP + '**candy-mold**'), 'candy-mold nested under success row');
+        assert.ok(r4.text.includes(L2_DEEP + '⏳ **honey-flap** Check queued'), 'lone queued stays inline');
     });
 
     it('handles deeper matrix names with adaptive recursion', () => {
@@ -253,10 +257,10 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         const r5 = mergeGithubTrackable(r4, checkRunEnv('macOS · PHP 8.3 · candy-pty', 'queued', ''));
 
         assert.ok(r5.text.includes(L1 + '**Windows**'), 'Windows group has multiple items → header');
-        assert.ok(r5.text.includes(L2 + '⏳ **PHP 8.3** Check queued'), 'PHP 8.3 sub-group rolled up under Windows');
-        assert.ok(r5.text.includes(L3 + '**candy-core**'), 'candy-core leaf in the rolled-up sub-tree');
-        assert.ok(r5.text.includes(L3 + '**sugar-prompt**'), 'sugar-prompt leaf in the rolled-up sub-tree');
-        assert.ok(r5.text.includes(L2 + '⏳ **PHP 8.4 · candy-shell** Check queued'), 'lone PHP 8.4 child rebuilds without repeating Windows');
+        assert.ok(r5.text.includes(L2_DEEP + '⏳ **PHP 8.3** Check queued'), 'PHP 8.3 sub-group rolled up under Windows');
+        assert.ok(r5.text.includes(L3_DEEP + '**candy-core**'), 'candy-core leaf in the rolled-up sub-tree');
+        assert.ok(r5.text.includes(L3_DEEP + '**sugar-prompt**'), 'sugar-prompt leaf in the rolled-up sub-tree');
+        assert.ok(r5.text.includes(L2_DEEP + '⏳ **PHP 8.4 · candy-shell** Check queued'), 'lone PHP 8.4 child rebuilds without repeating Windows');
         assert.ok(r5.text.includes(L1 + '⏳ **macOS · PHP 8.3 · candy-pty** Check queued'), 'lone macOS branch stays flat at top level');
         assert.ok(!r5.text.includes(L1 + '**macOS**'), 'no spurious macOS header for a single item');
     });

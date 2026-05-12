@@ -612,7 +612,22 @@ function renderTrackable(header, items) {
     renderChecksGrouped(checkItems, 1, lines);
 
     if (lines.length === 0) return '';
-    return lines.join('\n');
+    let result = lines.join('\n');
+
+    // Teams natively renders 2 visual levels of Markdown nested bullets
+    // (level 1 plus one level of indentation). When the tree we built
+    // never goes deeper than that — no line starts with the level-3 NBSP
+    // prefix (4 NBSPs + `-`) — swap the level-2 NBSPs back to regular
+    // spaces so Teams falls back to its native nested-list rendering
+    // which looks cleaner than literal indented text. As soon as we have
+    // depth 3+ the NBSPs stay so the visible indent doesn't collapse
+    // past Teams' single-level Markdown nesting limit.
+    const L3_PREFIX = NBSP.repeat(4) + '-';
+    const hasDepth3 = result.split('\n').some(l => l.startsWith(L3_PREFIX));
+    if (!hasDepth3) {
+        result = result.replace(new RegExp('^' + NBSP + '+', 'gm'), m => ' '.repeat(m.length));
+    }
+    return result;
 }
 
 /**
