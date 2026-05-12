@@ -199,6 +199,98 @@ function normalizeGithubDedup(it) {
     extra.dedup_key = `github:commit:${ sha }`;
 }
 
+// ---------------------------------------------------------------------------
+// GitHub trackable message merger (pure)
+// ---------------------------------------------------------------------------
+
+const JOB_LIST_MARKER = '\n\n— jobs —\n';
+// Short-SHA-prefixed commit header (e.g. "4fd48e4 fix bug").
+const COMMIT_SHA_RE = /^[0-9a-f]{7} [^\n]*/;
+// Emoji that indicate a commit/push header line (not a job status).
+const COMMIT_HEADER_EMOJI_RE = /^📦/u;
+// Emoji that indicate job status lines. The `u` flag is required so the
+// character class matches full code points; without it, 📦 (D83D DCE6)
+// would falsely match because it shares the D83D high surrogate with 🔄
+// (D83D DD04), and the regex engine treats each surrogate half as a
+// separate code unit. That collision is what produced the
+// "push + — jobs — + push" duplication bug.
+const JOB_EMOJI_RE = /^[⏳🔄✅❌⏭️⚠️ℹ️❓]/u;
+
+/**
+ * Merge a new envelope into an existing trackable message text for the same
+ * commit SHA. Pure: returns the new message text. Inputs:
+ *   existingText — recent.text (whatever was last sent for this dedup_key)
+ *   env          — the incoming envelope (env.message, env.extra.event_type)
+ *
+ * The output is parsed as `{header}{JOB_LIST_MARKER}{jobList}` on the next
+ * call. New push → replaces header, preserves jobList. New job event →
+ * inserts/updates that job's line in jobList. Unknown event → appended.
+ */
+function mergeGithubTrackable(existingText, env) {
+    const extra = env.extra || {};
+    let header = '';
+    let jobList = '';
+
+    const trimmedExisting = existingText.trim();
+    const markerPos = existingText.indexOf(JOB_LIST_MARKER);
+    if (markerPos !== -1) {
+        header = existingText.slice(0, markerPos);
+        jobList = existingText.slice(markerPos + JOB_LIST_MARKER.length);
+    } else if (COMMIT_SHA_RE.test(existingText) || COMMIT_HEADER_EMOJI_RE.test(trimmedExisting)) {
+        // Existing is a commit header (either short SHA prefix or a 📦 push
+        // message). Preserve as header; no jobs yet.
+        header = existingText;
+    } else if (JOB_EMOJI_RE.test(trimmedExisting)) {
+        // Existing is a job-only placeholder (a job event arrived before the
+        // push). Incoming push becomes the new header, existing job line
+        // moves into the job list.
+        header = env.message || `[${ extra.event_type }]`;
+        jobList = existingText;
+    } else {
+        // Unknown format — preserve existing text as the header and leave
+        // jobList empty. The isCommitMessage / jobLine branches decide what
+        // to do with the incoming envelope; we must NOT preemptively stuff
+        // the incoming text into jobList, or a duplicate push will surface
+        // as `header + — jobs — + header`.
+        header = existingText;
+    }
+
+    const jobLine = buildGithubJobLine(env);
+    const eventType = extra.event_type || '';
+    const isPushEvent = (eventType === 'push');
+    // isCommitMessage is true ONLY for push events with no job line.
+    const isCommitMessage = isPushEvent && !jobLine && env.message && String(env.message).trim().length > 0;
+
+    if (isCommitMessage) {
+        header = env.message || '';
+        return header + (jobList ? JOB_LIST_MARKER + jobList : '');
+    }
+    if (jobLine) {
+        // Insert or replace the line for this job by name match.
+        const jobNameMatch = jobLine.match(/^[^\s]+\s+(.+?)(?:\s|$)/);
+        const incomingJobName = jobNameMatch ? jobNameMatch[1].trim() : '';
+        if (jobList.length === 0) {
+            jobList = jobLine;
+        } else {
+            const lines = jobList.split('\n');
+            let replaced = false;
+            const newLines = lines.map(line => {
+                const existingNameMatch = line.match(/^[^\s]+\s+(.+?)(?:\s|$)/);
+                const existingJobName = existingNameMatch ? existingNameMatch[1].trim() : '';
+                if (existingJobName === incomingJobName) {
+                    replaced = true;
+                    return jobLine;
+                }
+                return line;
+            });
+            jobList = replaced ? newLines.join('\n') : `${ jobList }\n${ jobLine }`;
+        }
+        return `${ header }${ JOB_LIST_MARKER }${ jobList }`;
+    }
+    // Fallback: just append the incoming text.
+    return `${ header }\n\n${ env.message || '' }`;
+}
+
 let stopping = false;
 let tickInFlight = false;
 let timer = null;
@@ -487,88 +579,7 @@ async function tryEdit(room, it, recent, stats) {
         const isGithubAppend = recentSha && currentSha && recentSha === currentSha;
 
         if (isGithubAppend) {
-            // ── GitHub commit append mode ──────────────────────────────────
-            // All events for the same commit SHA land in one trackable message.
-            // Parse existing text as: {header} + "— jobs —" + {existing job list}
-            //
-            // New job arrives → append to job list, update message
-            // New commit (push) arrives → replace header only, keep job list
-            //   (so the push replaces the placeholder job-only header with
-            //    the real commit info while preserving CI status)
-            const existingText = recent.text || '';
-            const JOB_LIST_MARKER = '\n\n— jobs —\n';
-            const COMMIT_SHA_RE = /^[0-9a-f]{7} [^\n]*/;
-            // Emoji that indicate job status lines (not commit headers)
-            const JOB_EMOJI_RE = /^[⏳🔄✅❌⏭️⚠️ℹ️❓]/;
-            let header = '';
-            let jobList = '';
-
-            const markerPos = existingText.indexOf(JOB_LIST_MARKER);
-            if (markerPos !== -1) {
-                header = existingText.slice(0, markerPos);
-                jobList = existingText.slice(markerPos + JOB_LIST_MARKER.length);
-            } else {
-                // No marker yet. If existing starts with a 7-char hex SHA it is
-                // a real commit header; if it starts with a job emoji, it is a
-                // job-only placeholder (created when a job arrived before the push).
-                // Otherwise, preserve the existing text as-is and just append.
-                if (COMMIT_SHA_RE.test(existingText)) {
-                    header = existingText;
-                } else if (JOB_EMOJI_RE.test(existingText.trim())) {
-                    // Existing is a job placeholder - incoming push becomes new header
-                    header = it.env.message || `[${ it.env.extra.event_type }]`;
-                    jobList = existingText;
-                } else {
-                    // Preserve existing text, treat incoming as a new job line
-                    header = existingText;
-                    const incomingLine = it.env.message || `[${ it.env.extra.event_type }]`;
-                    jobList = incomingLine;
-                }
-            }
-
-            // Determine the new job line to append/update
-            const jobLine = buildGithubJobLine(it.env);
-            // Only treat as commit message if it's a push event AND there's no job line.
-            // This ensures job events (check_run, workflow_job, workflow_run) never
-            // replace the header - they either add to job list or append to text.
-            const eventType = it.env.extra.event_type || '';
-            const isPushEvent = (eventType === 'push');
-            // isCommitMessage is true ONLY for push events with no job line
-            const isCommitMessage = isPushEvent && !jobLine && it.env.message && String(it.env.message).trim().length > 0;
-
-            if (isCommitMessage) {
-                // ── New commit/push message arrived — replace header, keep job list
-                header = it.env.message || '';
-                newText = header + (jobList ? JOB_LIST_MARKER + jobList : '');
-            } else if (jobLine) {
-                // ── New job status — replace existing line for same job, or append new
-                // Extract job name from jobLine (format: "emoji Name status (url)")
-                const jobNameMatch = jobLine.match(/^[^\s]+\s+(.+?)(?:\s|$)/);
-                const incomingJobName = jobNameMatch ? jobNameMatch[1].trim() : '';
-
-                if (jobList.length === 0) {
-                    jobList = jobLine;
-                } else {
-                    // Try to find and replace existing line for this job
-                    const lines = jobList.split('\n');
-                    let replaced = false;
-                    const newLines = lines.map(line => {
-                        // Extract job name from existing line
-                        const existingNameMatch = line.match(/^[^\s]+\s+(.+?)(?:\s|$)/);
-                        const existingJobName = existingNameMatch ? existingNameMatch[1].trim() : '';
-                        if (existingJobName === incomingJobName) {
-                            replaced = true;
-                            return jobLine;
-                        }
-                        return line;
-                    });
-                    jobList = replaced ? newLines.join('\n') : `${ jobList }\n${ jobLine }`;
-                }
-                newText = `${ header }${ JOB_LIST_MARKER }${ jobList }`;
-            } else {
-                // Fallback: just append
-                newText = `${ header }\n\n${ it.env.message || '' }`;
-            }
+            newText = mergeGithubTrackable(recent.text || '', it.env);
         } else {
             // ── Standard append mode (non-GitHub or different commit) ──────
             const appended = (recent.appended_count || 0) + 1;
@@ -1028,4 +1039,4 @@ async function getHealth() {
     }
 }
 
-module.exports = { startConsumer, stopConsumer, getHealth, runTick, getNotifRedis };
+module.exports = { startConsumer, stopConsumer, getHealth, runTick, getNotifRedis, mergeGithubTrackable };
