@@ -436,11 +436,29 @@ async function processRoom(room, batch, stats) {
 
 async function handleTrackable(room, it, stats) {
     let recent = null;
+    const dedupKey = it.env.extra.dedup_key;
+
+    // Primary lookup by dedup_key
     try {
-        const raw = await redis.hget(recentKey(room), it.env.extra.dedup_key);
+        const raw = await redis.hget(recentKey(room), dedupKey);
         if (raw) recent = JSON.parse(raw);
     } catch (err) {
         console.warn('[notif] hget failed:', err.message);
+    }
+
+    // Secondary lookup by commit SHA: if we have a _commit_sha and the primary
+    // lookup missed, try github:commit:{sha} as the key. This handles the case
+    // where a push was saved with its PHP-set dedup_key before normalizeGithubDedup
+    // changed it to the commit-based key, but a subsequent job is looking for the
+    // commit-based key.
+    if (!recent && it.env.extra._commit_sha) {
+        try {
+            const shaBasedKey = `github:commit:${ it.env.extra._commit_sha }`;
+            const raw = await redis.hget(recentKey(room), shaBasedKey);
+            if (raw) recent = JSON.parse(raw);
+        } catch (err) {
+            console.warn('[notif] hget sha-based lookup failed:', err.message);
+        }
     }
 
     if (recent && recent.activityId && (Date.now() - recent.ts < EDIT_WINDOW_MS) && recent.type === it.env.type) {
