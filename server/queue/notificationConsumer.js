@@ -612,22 +612,25 @@ function renderTrackable(header, items) {
     renderChecksGrouped(checkItems, 1, lines);
 
     if (lines.length === 0) return '';
-    let result = lines.join('\n');
 
-    // Teams natively renders 2 visual levels of Markdown nested bullets
-    // (level 1 plus one level of indentation). When the tree we built
-    // never goes deeper than that — no line starts with the level-3 NBSP
-    // prefix (4 NBSPs + `-`) — swap the level-2 NBSPs back to regular
-    // spaces so Teams falls back to its native nested-list rendering
-    // which looks cleaner than literal indented text. As soon as we have
-    // depth 3+ the NBSPs stay so the visible indent doesn't collapse
-    // past Teams' single-level Markdown nesting limit.
+    // Teams natively renders two visual levels of Markdown nested bullets
+    // (level 1 plus one indent). When the tree we built never goes deeper
+    // than that — no line starts with the level-3 NBSP prefix (4 NBSPs +
+    // `-`) — swap the level-2 NBSPs on each bullet back to regular spaces
+    // and join with plain `\n`, so Teams uses its native nested-list
+    // rendering. As soon as we have depth 3+ the NBSPs stay; in that mode
+    // the deeper lines aren't Markdown list items (the NBSP prefix is not
+    // Markdown whitespace, so the leading `-` is literal text inside the
+    // parent list-item continuation), and Teams would otherwise concat
+    // them onto a single line. Joining with `  \n` (two trailing spaces
+    // before each newline) emits the CommonMark hard line break so the
+    // lines render separately.
     const L3_PREFIX = NBSP.repeat(4) + '-';
-    const hasDepth3 = result.split('\n').some(l => l.startsWith(L3_PREFIX));
-    if (!hasDepth3) {
-        result = result.replace(new RegExp('^' + NBSP + '+', 'gm'), m => ' '.repeat(m.length));
+    const hasDepth3 = lines.some(l => l.startsWith(L3_PREFIX));
+    if (hasDepth3) {
+        return lines.join('  \n');
     }
-    return result;
+    return lines.join('\n').replace(new RegExp('^' + NBSP + '+', 'gm'), m => ' '.repeat(m.length));
 }
 
 /**
