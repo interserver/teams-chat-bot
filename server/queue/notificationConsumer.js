@@ -176,25 +176,27 @@ function normalizeGithubDedup(it) {
     const extra = it.env.extra = it.env.extra || {};
     const eventType = extra.event_type || '';
 
-    // For push, workflow_job, check_run, check_suite: always use commit-based dedup
-    // so they can all edit the same message for the same commit
+    // For all GitHub events that carry a commit SHA: ensure we have _commit_sha set
+    // even if dedup_key was already set by PHP. This enables secondary SHA-based lookup.
+    const sha = extractCommitSha(it.env);
+    if (!sha) return; // no SHA — can't group
+
+    extra._commit_sha = sha;
+
+    // For push, workflow_job, check_run, check_suite, workflow_run:
+    // ensure dedup_key is commit-based so all events for same commit group together
     if (eventType === 'push' || eventType === 'workflow_job' ||
-        eventType === 'check_run' || eventType === 'check_suite') {
-        const sha = extractCommitSha(it.env);
-        if (sha) {
-            extra.dedup_key = `github:commit:${ sha }`;
-            extra._commit_sha = sha;
-        }
+        eventType === 'check_run' || eventType === 'check_suite' ||
+        eventType === 'workflow_run') {
+        extra.dedup_key = `github:commit:${ sha }`;
         return;
     }
 
     // For other events with existing dedup_key, preserve it
     if (extra.dedup_key) return;
 
-    const sha = extractCommitSha(it.env);
-    if (!sha) return; // no SHA — can't group
+    // For events without dedup_key, set commit-based key for grouping
     extra.dedup_key = `github:commit:${ sha }`;
-    extra._commit_sha = sha;
 }
 
 let stopping = false;
@@ -496,6 +498,8 @@ async function tryEdit(room, it, recent, stats) {
             const existingText = recent.text || '';
             const JOB_LIST_MARKER = '\n\n— jobs —\n';
             const COMMIT_SHA_RE = /^[0-9a-f]{7} [^\n]*/;
+            // Emoji that indicate job status lines (not commit headers)
+            const JOB_EMOJI_RE = /^[⏳🔄✅❌⏭️⚠️ℹ️❓]/;
             let header = '';
             let jobList = '';
 
@@ -504,21 +508,33 @@ async function tryEdit(room, it, recent, stats) {
                 header = existingText.slice(0, markerPos);
                 jobList = existingText.slice(markerPos + JOB_LIST_MARKER.length);
             } else {
-                // No marker yet.  If existing starts with a 7-char hex SHA it is
-                // a real commit header; otherwise it is a job-only placeholder
-                // (created when a job arrived before the push).  In that case the
-                // incoming commit message becomes the new header.
+                // No marker yet. If existing starts with a 7-char hex SHA it is
+                // a real commit header; if it starts with a job emoji, it is a
+                // job-only placeholder (created when a job arrived before the push).
+                // Otherwise, preserve the existing text as-is and just append.
                 if (COMMIT_SHA_RE.test(existingText)) {
                     header = existingText;
-                } else {
+                } else if (JOB_EMOJI_RE.test(existingText.trim())) {
+                    // Existing is a job placeholder - incoming push becomes new header
                     header = it.env.message || `[${ it.env.extra.event_type }]`;
                     jobList = existingText;
+                } else {
+                    // Preserve existing text, treat incoming as a new job line
+                    header = existingText;
+                    const incomingLine = it.env.message || `[${ it.env.extra.event_type }]`;
+                    jobList = incomingLine;
                 }
             }
 
             // Determine the new job line to append/update
             const jobLine = buildGithubJobLine(it.env);
-            const isCommitMessage = !jobLine && it.env.message && String(it.env.message).trim().length > 0;
+            // Only treat as commit message if it's a push event AND there's no job line.
+            // This ensures job events (check_run, workflow_job, workflow_run) never
+            // replace the header - they either add to job list or append to text.
+            const eventType = it.env.extra.event_type || '';
+            const isPushEvent = (eventType === 'push');
+            // isCommitMessage is true ONLY for push events with no job line
+            const isCommitMessage = isPushEvent && !jobLine && it.env.message && String(it.env.message).trim().length > 0;
 
             if (isCommitMessage) {
                 // ── New commit/push message arrived — replace header, keep job list
