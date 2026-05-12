@@ -83,7 +83,7 @@ function extractCommitSha(env) {
 
 /**
  * Build a single status line for a GitHub job event (check_run / workflow_job).
- * Format: [check_run|workflow] name | failures:N | conclusion:STATUS
+ * Format: {emoji} {job_name} {status_or_conclusion}
  * Returns null if this envelope doesn't represent a runnable job.
  */
 function buildGithubJobLine(env) {
@@ -92,75 +92,55 @@ function buildGithubJobLine(env) {
     const eventType = extra.event_type || '';
 
     let name = '';
-    let failures = 0;
     let conclusion = '';
     let status = '';
     let htmlUrl = '';
-    let startedAt = '';
-    let completedAt = '';
 
     if (eventType === 'check_run') {
         const cr = data.check_run || {};
         name = cr.name || 'check_run';
-        failures = cr.failures_count || 0;
         conclusion = cr.conclusion || '';
         status = cr.status || '';
         htmlUrl = cr.html_url || '';
-        startedAt = cr.started_at || '';
-        completedAt = cr.completed_at || '';
     } else if (eventType === 'workflow_job') {
         const wj = data.workflow_job || {};
         name = wj.name || wj.workflow_name || 'workflow_job';
-        failures = wj.failures_count || 0;
         conclusion = wj.conclusion || '';
         status = wj.status || '';
         htmlUrl = wj.html_url || '';
-        startedAt = wj.started_at || '';
-        completedAt = wj.completed_at || '';
     } else {
         return null;
     }
 
-    // Build the line components
-    const label = eventType === 'check_run' ? 'check_run' : 'workflow';
-    const parts = [`[${ label }] ${ name }`];
+    // Determine emoji and status text
+    let emoji = '';
+    let statusText = '';
 
-    // For check_run: also include commit short SHA and first line of commit msg
-    // (pulled from the check_suite head_commit) so the line is self-contained.
-    if (eventType === 'check_run') {
-        const commit = data.check_run?.check_suite?.head_commit;
-        if (commit) {
-            const shortSha = (commit.id || '').slice(0, 7);
-            const msgFirstLine = (commit.message || '').split('\n')[0];
-            if (shortSha) parts.push(shortSha);
-            if (msgFirstLine) parts.push(msgFirstLine.slice(0, 80));
-        }
-    } else if (eventType === 'workflow_job') {
-        // workflow_job references a workflow_run — pull head SHA from there
-        const wfRun = data.workflow_job?.workflow_run;
-        if (wfRun) {
-            const shortSha = (wfRun.head_sha || '').slice(0, 7);
-            if (shortSha) parts.push(shortSha);
-        }
-    }
-
-    if (status && !conclusion) {
-        parts.push(`status: ${ status }`);
-    }
-    if (failures > 0) {
-        parts.push(`failures: ${ failures }`);
-    }
     if (conclusion) {
-        parts.push(`conclusion: ${ conclusion }`);
+        // Has conclusion - job completed
+        switch (conclusion) {
+        case 'success': emoji = '✅'; break;
+        case 'failure': emoji = '❌'; break;
+        case 'skipped': emoji = '⏭️'; break;
+        case 'cancelled': emoji = '⚠️'; break;
+        case 'neutral': emoji = 'ℹ️'; break;
+        default: emoji = '❓';
+        }
+        statusText = conclusion;
+    } else if (status) {
+        // No conclusion yet - in progress
+        switch (status) {
+        case 'queued': emoji = '⏳'; statusText = 'queued'; break;
+        case 'in_progress': emoji = '🔄'; statusText = 'in_progress'; break;
+        case 'waiting': emoji = '⏸️'; statusText = 'waiting'; break;
+        default: emoji = '❓'; statusText = status;
+        }
+    } else {
+        return null; // Can't build line without status or conclusion
     }
 
-    // Show elapsed time if started but not completed
-    if (startedAt && !completedAt) {
-        const elapsed = elapsedMs(startedAt);
-        if (elapsed !== null) parts.push(`elapsed: ${ elapsed }`);
-    }
-
-    let line = parts.join(' | ');
+    let line = `${ emoji } ${ name }`;
+    if (statusText) line += ` ${ statusText }`;
     if (htmlUrl) line += ` (${ htmlUrl })`;
 
     return line;
@@ -194,7 +174,23 @@ function elapsedMs(isoTimestamp) {
  */
 function normalizeGithubDedup(it) {
     const extra = it.env.extra = it.env.extra || {};
-    if (extra.dedup_key) return; // already has one — preserve
+    const eventType = extra.event_type || '';
+
+    // For push, workflow_job, check_run, check_suite: always use commit-based dedup
+    // so they can all edit the same message for the same commit
+    if (eventType === 'push' || eventType === 'workflow_job' ||
+        eventType === 'check_run' || eventType === 'check_suite') {
+        const sha = extractCommitSha(it.env);
+        if (sha) {
+            extra.dedup_key = `github:commit:${ sha }`;
+            extra._commit_sha = sha;
+        }
+        return;
+    }
+
+    // For other events with existing dedup_key, preserve it
+    if (extra.dedup_key) return;
+
     const sha = extractCommitSha(it.env);
     if (!sha) return; // no SHA — can't group
     extra.dedup_key = `github:commit:${ sha }`;
@@ -511,12 +507,28 @@ async function tryEdit(room, it, recent, stats) {
                 header = it.env.message || '';
                 newText = header + (jobList ? JOB_LIST_MARKER + jobList : '');
             } else if (jobLine) {
-                // ── New job status — always append as a new entry (don't update in-place)
-                // This gives a chronological timeline: queued → in_progress → success/failure
+                // ── New job status — replace existing line for same job, or append new
+                // Extract job name from jobLine (format: "emoji Name status (url)")
+                const jobNameMatch = jobLine.match(/^[^\s]+\s+(.+?)(?:\s|$)/);
+                const incomingJobName = jobNameMatch ? jobNameMatch[1].trim() : '';
+
                 if (jobList.length === 0) {
                     jobList = jobLine;
                 } else {
-                    jobList = `${ jobList }\n${ jobLine }`;
+                    // Try to find and replace existing line for this job
+                    const lines = jobList.split('\n');
+                    let replaced = false;
+                    const newLines = lines.map(line => {
+                        // Extract job name from existing line
+                        const existingNameMatch = line.match(/^[^\s]+\s+(.+?)(?:\s|$)/);
+                        const existingJobName = existingNameMatch ? existingNameMatch[1].trim() : '';
+                        if (existingJobName === incomingJobName) {
+                            replaced = true;
+                            return jobLine;
+                        }
+                        return line;
+                    });
+                    jobList = replaced ? newLines.join('\n') : `${ jobList }\n${ jobLine }`;
                 }
                 newText = `${ header }${ JOB_LIST_MARKER }${ jobList }`;
             } else {
