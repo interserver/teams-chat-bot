@@ -11,8 +11,10 @@ const { mergeGithubTrackable } = require('../server/queue/notificationConsumer')
 const NBSP = ' ';
 const L1 = '- ';
 const L2_SHALLOW = '  - ';
-const L2_DEEP = NBSP.repeat(2) + '- ';
-const L3_DEEP = NBSP.repeat(4) + '- ';
+// Deep mode doubles the per-level NBSP step so depth 3 vs depth 4 is
+// clearly distinguishable in Teams' rendering.
+const L2_DEEP = NBSP.repeat(4) + '- ';
+const L3_DEEP = NBSP.repeat(8) + '- ';
 
 const PUSH_MSG = '📦 Joe Huss pushed 1 commit to interserver/teams-chat-bot main (compare)\n• 4fd48e4 updates to the message grouping logic (~1 files)';
 const CHECK_RUN_MSG = '⏳ Check **Excavate** in_progress for detain/scoop-emulators on `master` (details)';

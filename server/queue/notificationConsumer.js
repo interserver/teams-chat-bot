@@ -628,7 +628,16 @@ function renderTrackable(header, items) {
     const L3_PREFIX = NBSP.repeat(4) + '-';
     const hasDepth3 = lines.some(l => l.startsWith(L3_PREFIX));
     if (hasDepth3) {
-        return lines.join('  \n');
+        // Deep mode: the renderer emits 2 NBSPs of indent per level, which
+        // worked for two levels but made depth 3 vs depth 4 hard to tell
+        // apart visually in Teams (2 vs 4 char widths of indent looks
+        // similar at a glance). Double the leading NBSP run on every line
+        // before serialising so each level steps 4 NBSPs further than its
+        // parent. The trailing `  \n` is CommonMark's hard line break,
+        // forcing each NBSP-text bullet onto its own row.
+        return lines
+            .map(l => l.replace(new RegExp('^' + NBSP + '+'), m => NBSP.repeat(m.length * 2)))
+            .join('  \n');
     }
     return lines.join('\n').replace(new RegExp('^' + NBSP + '+', 'gm'), m => ' '.repeat(m.length));
 }
