@@ -36,9 +36,24 @@ function shouldSkip(envelope) {
         // grouped with their parent commit message via commit-scope
         // dedup keys (see normalizeGithubDedup in notificationConsumer).
         if (eventType === 'check_run') {
+            // Defensive: GitHub Actions has a long-standing quirk where a
+            // matrix job that gets skipped before its matrix can expand
+            // (e.g. via a needs-failure on an upstream job) emits one
+            // placeholder check_run per declared cell using the literal
+            // `name:` template — so the check_run name carries unexpanded
+            // text like "Coverage · ${{ matrix.lib }}". Those are pure
+            // noise (zero matrix-cell info, never actionable). Drop them
+            // silently rather than redirecting to int-dev-announce.
+            const crName = (data.check_run && data.check_run.name) || '';
+            if (crName.includes('${{')) return '__SILENT__';
             return null; // pass through
         }
         if (eventType === 'workflow_job') {
+            // Same quirk applies to workflow_job — its `name` is the
+            // job's display name, which is also `${{ matrix.* }}`-templated
+            // for matrix jobs and stays unexpanded on a pre-matrix skip.
+            const wjName = (data.workflow_job && data.workflow_job.name) || '';
+            if (wjName.includes('${{')) return '__SILENT__';
             return null; // pass through
         }
         if (eventType === 'check_suite') {
