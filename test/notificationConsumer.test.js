@@ -158,6 +158,20 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         assert.equal(r2.text, r1.text);
     });
 
+    it('handles re-delivery when the stored header is the legacy unsplit env.message', () => {
+        // Before initialTrackableState, handleSingleNew saved the full multi-
+        // line push message as recent.header with items = []. The next
+        // arrival of the same push would compare splitHeaderAndBullets(incoming)
+        // (just the first line) against header.trim() (the full text),
+        // miss the match, and append the entire push again as a bullet —
+        // producing a duplicated push with a nested commit sub-bullet.
+        const legacyRecent = { header: PUSH_MSG, items: [], header_identity: null, text: PUSH_MSG };
+        const r = mergeGithubTrackable(legacyRecent, pushEnv());
+        assert.equal(r.items.length, 0, 'legacy unsplit re-delivery must not append');
+        assert.ok(!r.text.includes(' - 📦'), 'no nested push line should appear');
+        assert.ok(!r.text.includes('  - 4fd48e4'), 'no doubly-indented commit sub-bullet should appear');
+    });
+
     it('accepts a legacy string for `recent` and treats it as the existing header', () => {
         const merged = mergeGithubTrackable(CHECK_RUN_MSG, statusEnv());
         assert.equal(merged.header, CHECK_RUN_MSG);

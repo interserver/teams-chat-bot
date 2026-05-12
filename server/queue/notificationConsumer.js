@@ -470,13 +470,24 @@ function mergeGithubTrackable(recent, env) {
         return { text: renderTrackable(header, items), header, items, header_identity: headerIdentity };
     }
 
-    // Re-delivery of the same event (no identity, header text already
-    // matches the incoming message's leading line). For multi-line events
-    // like push we compare against the header-only portion so that
-    // bullet-list lines below it aren't appended again.
+    // Re-delivery of the same event. Compare on the first non-empty line of
+    // each side so the check works whether the stored header was already
+    // split (header = first line, items hold the commit list) or is still
+    // the unsplit verbose message saved by handleSingleNew on the very
+    // first send (header = full multi-line). Without this two-sided first-
+    // line compare, a push arriving twice would render as
+    //   📦 …push…
+    //   • sha …
+    //    - 📦 …push…
+    //      - sha …
     if (!incomingIdentity) {
-        const incomingSplit = splitHeaderAndBullets(bulletMessage);
-        if (incomingSplit.headerText && incomingSplit.headerText === header.trim()) {
+        const firstLine = (s) => String(s || '')
+            .split('\n')
+            .map(l => l.trim())
+            .find(l => l.length > 0) || '';
+        const incomingFirst = firstLine(bulletMessage);
+        const headerFirst = firstLine(header);
+        if (incomingFirst && incomingFirst === headerFirst) {
             return { text: renderTrackable(header, items), header, items, header_identity: headerIdentity };
         }
     }
@@ -847,6 +858,30 @@ async function tryEdit(room, it, recent, stats) {
     return true;
 }
 
+/**
+ * Compute the initial `{ header, items, header_identity }` to persist
+ * alongside a freshly sent envelope. For text messages this splits leading
+ * `•` bullet lines (a push's commit list) out of the header so that any
+ * subsequent merge for the same dedup_key sees the same structure that
+ * `mergeGithubTrackable` would have produced — preventing the same push
+ * from being appended as a verbatim bullet on re-delivery.
+ */
+function initialTrackableState(env) {
+    if (env.type !== 'msg') {
+        return { header: '', items: [], header_identity: null };
+    }
+    const message = String(env.message || '');
+    if (!message) {
+        return { header: '', items: [], header_identity: jobIdentity(env) };
+    }
+    const split = splitHeaderAndBullets(message);
+    return {
+        header: split.headerText,
+        items: split.bulletItems,
+        header_identity: jobIdentity(env)
+    };
+}
+
 async function handleSingleNew(room, it, stats) {
     const conversationId = resolveChannel(room) || resolveChannel('notifications');
     if (!conversationId) {
@@ -868,14 +903,13 @@ async function handleSingleNew(room, it, stats) {
         const constructedActivityId = await tryConstructedConvRef(room, conversationId, activity, stats);
         if (constructedActivityId) {
             if (constructedActivityId && it.env.extra && it.env.extra.dedup_key) {
+                const initial = initialTrackableState(it.env);
                 await saveRecent(room, it.env.extra.dedup_key, {
                     activityId: constructedActivityId,
                     ts: Date.now(),
                     type: it.env.type,
                     text: it.env.message,
-                    header: it.env.type === 'msg' ? (it.env.message || '') : '',
-                    items: [],
-                    header_identity: it.env.type === 'msg' ? jobIdentity(it.env) : null,
+                    ...initial,
                     appended_count: 0,
                     conversationId,
                     commit_sha: it.env.extra._commit_sha || null
@@ -913,14 +947,13 @@ async function handleSingleNew(room, it, stats) {
     console.log(`[notif]   sent room=${ room } activity=${ activityId || '<none>' }`);
 
     if (activityId && it.env.extra && it.env.extra.dedup_key) {
+        const initial = initialTrackableState(it.env);
         await saveRecent(room, it.env.extra.dedup_key, {
             activityId,
             ts: Date.now(),
             type: it.env.type,
             text: it.env.message,
-            header: it.env.type === 'msg' ? (it.env.message || '') : '',
-            items: [],
-            header_identity: it.env.type === 'msg' ? jobIdentity(it.env) : null,
+            ...initial,
             appended_count: 0,
             conversationId,
             commit_sha: it.env.extra._commit_sha || null
