@@ -378,74 +378,217 @@ function bulletPrefix(level) {
 }
 
 /**
- * Try to decompose a structured check_run name into (platform, php, lib)
- * so a flat list of dozens of platform/version/lib checks can be rendered
- * as a tree. Recognises two common GitHub-Actions naming patterns:
+ * Decompose a structured check_run name into a list of grouping segments
+ * plus a leaf. Recognises the GitHub-Actions naming patterns we see in
+ * practice and returns null if none of them fit:
  *
- *   "Windows · PHP 8.3 · candy-core" → { platform: 'Windows', php: 'PHP 8.3', lib: 'candy-core' }
- *   "Test PHP 8.4 · candy-vt"        → { platform: 'Test',    php: 'PHP 8.4', lib: 'candy-vt'   }
+ *   "render (candy-vcr)"             → segments=["render"],            leaf="candy-vcr"
+ *   "Windows · PHP 8.3 · candy-core" → segments=["Windows","PHP 8.3"], leaf="candy-core"
+ *   "Test PHP 8.4 · candy-vt"        → segments=["Test","PHP 8.4"],    leaf="candy-vt"
+ *   "build (linux)"                  → segments=["build"],             leaf="linux"
+ *   "changed"                        → null (no decomposition possible)
  *
- * Returns null for names that don't carry a `PHP X.Y` segment or that
- * don't have anything after the version (no lib to nest under).
+ * "PHP X.Y" embedded inside a `·`-segment is split into its own segment
+ * so all PHP X.Y siblings naturally collapse under one bucket.
  */
-function decomposeCheckName(name) {
-    const parts = String(name || '').split(' · ').map(s => s.trim()).filter(Boolean);
-    if (parts.length < 2) return null;
-    const phpRe = /(PHP \d+\.\d+)/;
-    let phpIdx = -1;
-    let phpVer = null;
-    for (let i = 0; i < parts.length; i++) {
-        const m = parts[i].match(phpRe);
-        if (m) { phpIdx = i; phpVer = m[1]; break; }
+function decomposeCheckSegments(name) {
+    let segments = [];
+    let leaf = String(name || '').trim();
+    if (!leaf) return null;
+
+    if (leaf.includes(' · ')) {
+        const parts = leaf.split(' · ').map(s => s.trim()).filter(Boolean);
+        segments = parts.slice(0, -1);
+        leaf = parts[parts.length - 1] || '';
     }
-    if (phpIdx === -1) return null;
-    const phpPart = parts[phpIdx];
-    const beforePhp = phpPart.replace(phpRe, '').trim();
-    const platformSegments = parts.slice(0, phpIdx);
-    if (beforePhp) platformSegments.push(beforePhp);
-    const platform = platformSegments.join(' · ') || 'other';
-    const lib = parts.slice(phpIdx + 1).join(' · ').trim();
-    if (!lib) return null;
-    return { platform, php: phpVer, lib };
+
+    // Split any "X PHP 8.Y" segment into "X" + "PHP 8.Y" (e.g. "Test PHP 8.4").
+    const phpRe = /^(.*?)\s*(PHP \d+\.\d+)\s*(.*)$/;
+    const expanded = [];
+    for (const seg of segments) {
+        const m = seg.match(phpRe);
+        if (m && m[2]) {
+            if (m[1]) expanded.push(m[1].trim());
+            expanded.push(m[2]);
+            if (m[3]) expanded.push(m[3].trim());
+        } else {
+            expanded.push(seg);
+        }
+    }
+    segments = expanded;
+
+    // "render (candy-vcr)" — promote "render" to a segment.
+    const parenMatch = leaf.match(/^(.+?)\s+\((.+)\)$/);
+    if (parenMatch) {
+        segments.push(parenMatch[1].trim());
+        leaf = parenMatch[2].trim();
+    }
+
+    if (segments.length === 0) return null;
+    if (!leaf) return null;
+    return { segments, leaf };
 }
 
 /**
- * Rewrite a condensed check_run bullet so the bolded name becomes just the
- * leaf lib name. The original text comes from `condensedBulletText` and is
- * shaped like `⏳ **<full check name>** Check queued ([details](url ...))`.
+ * Parse the condensed text produced by `condensedBulletText` for a
+ * check_run back into its components so renderer code can recompose it in
+ * a different shape (e.g. share the status row across leaves).
+ *
+ *   "✅ **changed** Check success ([details](url \"url\"))"
+ *      → { emoji: '✅', name: 'changed', statusText: 'success',
+ *          urlLink: '([details](url "url"))' }
+ *
+ * Returns null when the text doesn't have the expected check_run shape
+ * (callers fall back to the verbatim text).
  */
-function reformatCheckLeaf(itemText, lib) {
-    const m = String(itemText || '').match(/^(\S+)\s+\*\*[^*]+\*\*\s+Check\s+(\S+)(.*)$/);
-    if (!m) return itemText;
-    return `${ m[1] } **${ lib }** Check ${ m[2] }${ m[3] }`;
+function parseCheckRunText(text) {
+    const m = String(text || '').match(/^(\S+)\s+\*\*([^*]+)\*\*\s+Check\s+(\S+)\s*(.*)$/);
+    if (!m) return null;
+    return {
+        emoji: m[1],
+        name: m[2].trim(),
+        statusText: m[3],
+        urlLink: m[4].trim()
+    };
 }
 
 /**
- * Render a trackable to its final text. Items render in insertion order at
- * the top level, except `check_run` items whose name decomposes into
- * `platform · PHP X.Y · lib` are bucketed into a 3-level tree at the end:
+ * Render the grouped section of a trackable for a list of `check_run`
+ * items that have been parsed and segmented. Recursive: each call peels
+ * off one prefix segment.
  *
- *   - <platform>
- *    - <PHP X.Y>
- *     - <emoji> **<lib>** Check <status> ([details](...))
- *
- * Items without identity (push commits, status events, PR events, etc.)
- * and workflow_job / non-decomposable check_run items stay as flat
- * top-level bullets so existing scenarios still render unchanged.
+ * Rules:
+ *  - A group with a single item is rendered flat (no extra nesting) so a
+ *    lone "render (foo)" stays as one bullet rather than spawning a one-
+ *    item "render" sub-tree.
+ *  - When a group's items have no further segments (we're at the leaf
+ *    level for that prefix), apply status compression:
+ *      * If every leaf shares the same status, the prefix and status are
+ *        combined into one header line and the leaves render with just
+ *        `**leaf** ([details](url))`.
+ *      * If statuses differ, the prefix header is bold-only and the
+ *        leaves are sub-grouped by status — a status sub-group of 2+
+ *        gets its own `emoji Check statusText` header with bare leaves
+ *        below, while a singleton status keeps the full inline form.
+ *  - When a group still has deeper segments, the prefix becomes a
+ *    bold-only header and recursion handles the rest.
+ */
+function renderChecksGrouped(checkItems, level, lines, depth = 0) {
+    if (checkItems.length === 0) return;
+
+    const groups = new Map();
+    const noPrefix = [];
+    for (const ci of checkItems) {
+        if (ci.segments.length === 0) {
+            noPrefix.push(ci);
+        } else {
+            const firstSeg = ci.segments[0];
+            if (!groups.has(firstSeg)) groups.set(firstSeg, []);
+            groups.get(firstSeg).push(ci);
+        }
+    }
+
+    for (const ci of noPrefix) {
+        lines.push(bulletPrefix(level) + leafInline(ci));
+    }
+
+    for (const [seg, group] of groups) {
+        if (group.length === 1) {
+            const ci = group[0];
+            if (depth === 0) {
+                // Top level — preserve the original full-name bullet so
+                // paren-style names like "render (candy-vcr)" stay readable
+                // as-is.
+                lines.push(bulletPrefix(level) + ci.originalText);
+            } else {
+                // Inside a recursive subtree — the parent header already
+                // carries the consumed segments, so rebuild the bullet from
+                // the remaining segments + leaf to avoid repeating them.
+                const remainingName = [...ci.segments, ci.leaf].join(' · ');
+                const link = ci.urlLink ? ' ' + ci.urlLink : '';
+                lines.push(bulletPrefix(level) + `${ ci.emoji } **${ remainingName }** Check ${ ci.statusText }${ link }`);
+            }
+            continue;
+        }
+
+        const stripped = group.map(ci => ({ ...ci, segments: ci.segments.slice(1) }));
+        const allLeaf = stripped.every(s => s.segments.length === 0);
+
+        if (!allLeaf) {
+            // Deeper nesting still possible — peel and recurse.
+            lines.push(bulletPrefix(level) + `**${ seg }**`);
+            renderChecksGrouped(stripped, level + 1, lines, depth + 1);
+            continue;
+        }
+
+        const allSameStatus = stripped.every(s => s.statusKey === stripped[0].statusKey);
+        if (allSameStatus) {
+            const first = stripped[0];
+            lines.push(bulletPrefix(level) + `${ first.emoji } **${ seg }** Check ${ first.statusText }`);
+            for (const s of stripped) {
+                lines.push(bulletPrefix(level + 1) + leafOnly(s));
+            }
+            continue;
+        }
+
+        // Mixed statuses at the leaf level: prefix-only header, then group by
+        // status (compress only when a status has 2+ items).
+        lines.push(bulletPrefix(level) + `**${ seg }**`);
+        const byStatus = new Map();
+        for (const s of stripped) {
+            if (!byStatus.has(s.statusKey)) byStatus.set(s.statusKey, []);
+            byStatus.get(s.statusKey).push(s);
+        }
+        for (const statusGroup of byStatus.values()) {
+            if (statusGroup.length >= 2) {
+                const first = statusGroup[0];
+                lines.push(bulletPrefix(level + 1) + `${ first.emoji } Check ${ first.statusText }`);
+                for (const s of statusGroup) {
+                    lines.push(bulletPrefix(level + 2) + leafOnly(s));
+                }
+            } else {
+                lines.push(bulletPrefix(level + 1) + leafInline(statusGroup[0]));
+            }
+        }
+    }
+}
+
+function leafInline(ci) {
+    const link = ci.urlLink ? ' ' + ci.urlLink : '';
+    return `${ ci.emoji } **${ ci.leaf }** Check ${ ci.statusText }${ link }`;
+}
+
+function leafOnly(ci) {
+    const link = ci.urlLink ? ' ' + ci.urlLink : '';
+    return `**${ ci.leaf }**${ link }`;
+}
+
+/**
+ * Render a trackable to its final text. Non-check_run items render as
+ * flat top-level bullets in insertion order; check_run items whose name
+ * decomposes are collected and rendered as a single adaptively-nested
+ * tree below the flat items (see `renderChecksGrouped`).
  */
 function renderTrackable(header, items) {
     const headerText = String(header || '').trim();
     const flatBullets = [];
-    const platformGroups = new Map();
+    const checkItems = [];
 
     for (const item of items) {
         if (item.identity && item.identity.startsWith('check_run:')) {
-            const decomposed = decomposeCheckName(item.identity.slice('check_run:'.length));
-            if (decomposed) {
-                if (!platformGroups.has(decomposed.platform)) platformGroups.set(decomposed.platform, new Map());
-                const phpMap = platformGroups.get(decomposed.platform);
-                if (!phpMap.has(decomposed.php)) phpMap.set(decomposed.php, []);
-                phpMap.get(decomposed.php).push({ lib: decomposed.lib, item });
+            const name = item.identity.slice('check_run:'.length);
+            const decomp = decomposeCheckSegments(name);
+            const parsed = parseCheckRunText(item.text);
+            if (decomp && parsed) {
+                checkItems.push({
+                    segments: decomp.segments,
+                    leaf: decomp.leaf,
+                    emoji: parsed.emoji,
+                    statusText: parsed.statusText,
+                    statusKey: parsed.emoji + ':' + parsed.statusText,
+                    urlLink: parsed.urlLink,
+                    originalText: item.text
+                });
                 continue;
             }
         }
@@ -456,16 +599,7 @@ function renderTrackable(header, items) {
     const lines = [];
     if (headerText) lines.push(headerText);
     lines.push(...flatBullets);
-
-    for (const [platform, phpMap] of platformGroups) {
-        lines.push(bulletPrefix(1) + platform);
-        for (const [php, libEntries] of phpMap) {
-            lines.push(bulletPrefix(2) + php);
-            for (const { lib, item } of libEntries) {
-                lines.push(bulletPrefix(3) + reformatCheckLeaf(item.text, lib));
-            }
-        }
-    }
+    renderChecksGrouped(checkItems, 1, lines);
 
     if (lines.length === 0) return '';
     return lines.join('\n');

@@ -194,45 +194,71 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         assert.equal(commentItems.length, 2, 'distinct comment ids → distinct bullets');
     });
 
-    it('renders structured check_run names as a platform → PHP → lib tree', () => {
+    it('keeps a single decomposable check_run flat (no premature nesting)', () => {
         const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
-        // A mix of "platform · PHP X.Y · lib" and "Test PHP X.Y · lib" names —
-        // both must end up in the right buckets.
-        const r2 = mergeGithubTrackable(r1, checkRunEnv('Windows · PHP 8.3 · candy-core', 'queued', '', '', 'https://example/win83/candy-core'));
-        const r3 = mergeGithubTrackable(r2, checkRunEnv('Windows · PHP 8.3 · sugar-prompt', 'queued', '', '', 'https://example/win83/sugar-prompt'));
-        const r4 = mergeGithubTrackable(r3, checkRunEnv('Windows · PHP 8.4 · candy-shell', 'queued', '', '', 'https://example/win84/candy-shell'));
-        const r5 = mergeGithubTrackable(r4, checkRunEnv('macOS · PHP 8.3 · candy-pty', 'queued', '', '', 'https://example/mac83/candy-pty'));
-        const r6 = mergeGithubTrackable(r5, checkRunEnv('Test PHP 8.4 · candy-vt', 'queued', '', '', 'https://example/test84/candy-vt'));
-        const r7 = mergeGithubTrackable(r6, checkRunEnv('Test PHP 8.3 · candy-mines', 'queued', '', '', 'https://example/test83/candy-mines'));
-
-        const lines = r7.text.split('\n');
-
-        // Platforms appear as level-1 bullets ` - Platform`.
-        assert.ok(lines.some(l => l === ' - Windows'), 'Windows platform group');
-        assert.ok(lines.some(l => l === ' - macOS'), 'macOS platform group');
-        assert.ok(lines.some(l => l === ' - Test'), 'Test platform group');
-
-        // PHP versions appear as level-2 bullets `  - PHP X.Y` under their platform.
-        assert.ok(lines.some(l => l === '  - PHP 8.3'), 'PHP 8.3 sub-group');
-        assert.ok(lines.some(l => l === '  - PHP 8.4'), 'PHP 8.4 sub-group');
-
-        // Leaf bullets carry just the lib name (not the full check_run name).
-        assert.ok(lines.some(l => l.startsWith('   - ⏳ **candy-core** Check queued')), 'candy-core leaf');
-        assert.ok(lines.some(l => l.startsWith('   - ⏳ **sugar-prompt** Check queued')), 'sugar-prompt leaf');
-        assert.ok(lines.some(l => l.startsWith('   - ⏳ **candy-pty** Check queued')), 'candy-pty leaf');
-        assert.ok(lines.some(l => l.startsWith('   - ⏳ **candy-vt** Check queued')), 'candy-vt leaf');
-
-        // The platform/version segments must NOT leak into leaf bullets.
-        assert.ok(!r7.text.includes('**Windows · PHP'), 'platform stripped from leaf names');
-        assert.ok(!r7.text.includes('**Test PHP'), '`Test PHP X.Y` prefix stripped from leaf names');
+        const r2 = mergeGithubTrackable(r1, checkRunEnv('render (candy-vcr)', 'completed', 'success'));
+        assert.ok(r2.text.includes(' - ✅ **render (candy-vcr)** Check success'), 'single render keeps full original text');
+        assert.ok(!r2.text.includes(' - **render**'), 'no prefix-only group spawned for one item');
     });
 
-    it('leaves a single-name check_run (no `·` separator) as a flat top-level bullet', () => {
+    it('collapses two same-status siblings under a combined prefix + status header', () => {
+        const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
+        const r2 = mergeGithubTrackable(r1, checkRunEnv('render (candy-vcr)', 'completed', 'success'));
+        const r3 = mergeGithubTrackable(r2, checkRunEnv('render (candy-mold)', 'completed', 'success'));
+        assert.ok(r3.text.includes(' - ✅ **render** Check success'), 'shared status combined into prefix header');
+        assert.ok(r3.text.match(/^  - \*\*candy-vcr\*\*/m), 'candy-vcr leaf with bare name');
+        assert.ok(r3.text.match(/^  - \*\*candy-mold\*\*/m), 'candy-mold leaf with bare name');
+        assert.ok(!r3.text.match(/^  - .* Check success/m), 'leaves do not re-state the status');
+    });
+
+    it('renders a prefix-only header when siblings have mixed statuses', () => {
+        const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
+        const r2 = mergeGithubTrackable(r1, checkRunEnv('render (candy-vcr)', 'completed', 'success'));
+        const r3 = mergeGithubTrackable(r2, checkRunEnv('render (honey-flap)', 'queued', ''));
+        assert.ok(r3.text.includes(' - **render**'), 'mixed statuses → prefix-only header');
+        assert.ok(!r3.text.includes(' - ✅ **render**'), 'no shared status emoji on prefix when statuses differ');
+        assert.ok(r3.text.match(/^  - ✅ \*\*candy-vcr\*\* Check success/m), 'success child stays inline with its status');
+        assert.ok(r3.text.match(/^  - ⏳ \*\*honey-flap\*\* Check queued/m), 'queued child stays inline with its status');
+    });
+
+    it('sub-groups by status only when 2+ siblings share that status', () => {
+        // 2 success + 1 queued under "render". The two successes share a
+        // status row; the queued lone-wolf stays inline beside it.
+        const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
+        const r2 = mergeGithubTrackable(r1, checkRunEnv('render (candy-vcr)', 'completed', 'success'));
+        const r3 = mergeGithubTrackable(r2, checkRunEnv('render (candy-mold)', 'completed', 'success'));
+        const r4 = mergeGithubTrackable(r3, checkRunEnv('render (honey-flap)', 'queued', ''));
+
+        assert.ok(r4.text.includes(' - **render**'), 'prefix-only header (mixed statuses)');
+        assert.ok(r4.text.match(/^  - ✅ Check success$/m), 'success sub-header without prefix');
+        assert.ok(r4.text.match(/^   - \*\*candy-vcr\*\*/m), 'candy-vcr nested under success row');
+        assert.ok(r4.text.match(/^   - \*\*candy-mold\*\*/m), 'candy-mold nested under success row');
+        assert.ok(r4.text.match(/^  - ⏳ \*\*honey-flap\*\* Check queued/m), 'lone queued stays inline');
+    });
+
+    it('handles deeper matrix names with adaptive recursion', () => {
+        // Two Windows·PHP 8.3 entries share status, one Windows·PHP 8.4 stands alone,
+        // and a single macOS entry shouldn't get a needless "macOS" header.
+        const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
+        const r2 = mergeGithubTrackable(r1, checkRunEnv('Windows · PHP 8.3 · candy-core', 'queued', ''));
+        const r3 = mergeGithubTrackable(r2, checkRunEnv('Windows · PHP 8.3 · sugar-prompt', 'queued', ''));
+        const r4 = mergeGithubTrackable(r3, checkRunEnv('Windows · PHP 8.4 · candy-shell', 'queued', ''));
+        const r5 = mergeGithubTrackable(r4, checkRunEnv('macOS · PHP 8.3 · candy-pty', 'queued', ''));
+
+        assert.ok(r5.text.includes(' - **Windows**'), 'Windows group has multiple items → header');
+        assert.ok(r5.text.includes('  - ⏳ **PHP 8.3** Check queued'), 'PHP 8.3 sub-group rolled up under Windows');
+        assert.ok(r5.text.match(/^   - \*\*candy-core\*\*/m), 'candy-core leaf in the rolled-up sub-tree');
+        assert.ok(r5.text.match(/^   - \*\*sugar-prompt\*\*/m), 'sugar-prompt leaf in the rolled-up sub-tree');
+        assert.ok(r5.text.includes('  - ⏳ **PHP 8.4 · candy-shell** Check queued'), 'lone PHP 8.4 child rebuilds without repeating Windows');
+        assert.ok(r5.text.includes(' - ⏳ **macOS · PHP 8.3 · candy-pty** Check queued'), 'lone macOS branch stays flat at top level');
+        assert.ok(!r5.text.includes(' - **macOS**'), 'no spurious macOS header for a single item');
+    });
+
+    it('leaves a non-decomposable check_run as a flat top-level bullet', () => {
         const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
         const r2 = mergeGithubTrackable(r1, checkRunEnv('build', 'completed', 'success'));
-        // No platform tree — just one flat bullet.
         assert.ok(r2.text.includes(' - ✅ **build** Check success'));
-        assert.ok(!r2.text.includes('  - PHP'));
+        assert.ok(!r2.text.includes(' - **build**\n'), 'no group header for non-decomposable name');
     });
 
     it('groups appveyor status, push, and check_run for the same SHA into one message', () => {
