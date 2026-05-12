@@ -344,11 +344,25 @@ function condensedBulletText(env) {
     return null;
 }
 
+// Teams' Markdown renderer only visually nests Markdown bullets one level
+// deep — `    - foo` collapses back to the same depth as `- foo`. To keep
+// deeper hierarchies legible, levels 2+ are emitted as plain text indented
+// with NBSPs (U+00A0) and a literal `- ` prefix. NBSP is not Markdown
+// whitespace, so the leading `- ` is rendered verbatim rather than parsed
+// as a nested list marker, and Teams preserves the indent visually.
+const NBSP = ' ';
+
+function bulletPrefix(level) {
+    if (level <= 1) return '- ';
+    return NBSP.repeat((level - 1) * 2) + '- ';
+}
+
 /**
  * Render an event's `message` as a nested bullet. The first non-empty line
- * gets ` - <text>` (top-level bullet). Embedded bullet markers `•`, `*`, or
- * `-` are promoted to `  - <text>` (one indent deeper). Other continuation
- * lines align under the text that follows the dash.
+ * gets a level-1 Markdown bullet (`- <text>`). Embedded `•`/`*`/`-`
+ * sub-bullets are promoted to level-2 NBSP-indented text bullets so Teams
+ * still shows the nesting under the parent. Other continuation lines align
+ * under the text that follows the dash.
  */
 function indentAsBullet(messageText) {
     const lines = String(messageText || '')
@@ -356,25 +370,21 @@ function indentAsBullet(messageText) {
         .split('\n')
         .map(l => l.trim())
         .filter(l => l.length > 0);
-    if (lines.length === 0) return ' - ';
+    if (lines.length === 0) return bulletPrefix(1);
     const out = [];
     let firstHandled = false;
     for (const line of lines) {
         const m = line.match(/^[•*\-]\s+(.+)/);
         if (m) {
-            out.push('  - ' + m[1]);
+            out.push(bulletPrefix(2) + m[1]);
         } else if (!firstHandled) {
-            out.push(' - ' + line);
+            out.push(bulletPrefix(1) + line);
             firstHandled = true;
         } else {
-            out.push('   ' + line);
+            out.push(NBSP.repeat(2) + line);
         }
     }
     return out.join('\n');
-}
-
-function bulletPrefix(level) {
-    return ' '.repeat(level) + '- ';
 }
 
 /**
