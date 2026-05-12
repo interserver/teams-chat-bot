@@ -373,11 +373,102 @@ function indentAsBullet(messageText) {
     return out.join('\n');
 }
 
+function bulletPrefix(level) {
+    return ' '.repeat(level) + '- ';
+}
+
+/**
+ * Try to decompose a structured check_run name into (platform, php, lib)
+ * so a flat list of dozens of platform/version/lib checks can be rendered
+ * as a tree. Recognises two common GitHub-Actions naming patterns:
+ *
+ *   "Windows · PHP 8.3 · candy-core" → { platform: 'Windows', php: 'PHP 8.3', lib: 'candy-core' }
+ *   "Test PHP 8.4 · candy-vt"        → { platform: 'Test',    php: 'PHP 8.4', lib: 'candy-vt'   }
+ *
+ * Returns null for names that don't carry a `PHP X.Y` segment or that
+ * don't have anything after the version (no lib to nest under).
+ */
+function decomposeCheckName(name) {
+    const parts = String(name || '').split(' · ').map(s => s.trim()).filter(Boolean);
+    if (parts.length < 2) return null;
+    const phpRe = /(PHP \d+\.\d+)/;
+    let phpIdx = -1;
+    let phpVer = null;
+    for (let i = 0; i < parts.length; i++) {
+        const m = parts[i].match(phpRe);
+        if (m) { phpIdx = i; phpVer = m[1]; break; }
+    }
+    if (phpIdx === -1) return null;
+    const phpPart = parts[phpIdx];
+    const beforePhp = phpPart.replace(phpRe, '').trim();
+    const platformSegments = parts.slice(0, phpIdx);
+    if (beforePhp) platformSegments.push(beforePhp);
+    const platform = platformSegments.join(' · ') || 'other';
+    const lib = parts.slice(phpIdx + 1).join(' · ').trim();
+    if (!lib) return null;
+    return { platform, php: phpVer, lib };
+}
+
+/**
+ * Rewrite a condensed check_run bullet so the bolded name becomes just the
+ * leaf lib name. The original text comes from `condensedBulletText` and is
+ * shaped like `⏳ **<full check name>** Check queued ([details](url ...))`.
+ */
+function reformatCheckLeaf(itemText, lib) {
+    const m = String(itemText || '').match(/^(\S+)\s+\*\*[^*]+\*\*\s+Check\s+(\S+)(.*)$/);
+    if (!m) return itemText;
+    return `${ m[1] } **${ lib }** Check ${ m[2] }${ m[3] }`;
+}
+
+/**
+ * Render a trackable to its final text. Items render in insertion order at
+ * the top level, except `check_run` items whose name decomposes into
+ * `platform · PHP X.Y · lib` are bucketed into a 3-level tree at the end:
+ *
+ *   - <platform>
+ *    - <PHP X.Y>
+ *     - <emoji> **<lib>** Check <status> ([details](...))
+ *
+ * Items without identity (push commits, status events, PR events, etc.)
+ * and workflow_job / non-decomposable check_run items stay as flat
+ * top-level bullets so existing scenarios still render unchanged.
+ */
 function renderTrackable(header, items) {
     const headerText = String(header || '').trim();
-    const bullets = items.map(it => indentAsBullet(it.text)).filter(b => b.length > 0);
-    if (bullets.length === 0) return headerText;
-    return headerText + '\n' + bullets.join('\n');
+    const flatBullets = [];
+    const platformGroups = new Map();
+
+    for (const item of items) {
+        if (item.identity && item.identity.startsWith('check_run:')) {
+            const decomposed = decomposeCheckName(item.identity.slice('check_run:'.length));
+            if (decomposed) {
+                if (!platformGroups.has(decomposed.platform)) platformGroups.set(decomposed.platform, new Map());
+                const phpMap = platformGroups.get(decomposed.platform);
+                if (!phpMap.has(decomposed.php)) phpMap.set(decomposed.php, []);
+                phpMap.get(decomposed.php).push({ lib: decomposed.lib, item });
+                continue;
+            }
+        }
+        const bullet = indentAsBullet(item.text);
+        if (bullet) flatBullets.push(bullet);
+    }
+
+    const lines = [];
+    if (headerText) lines.push(headerText);
+    lines.push(...flatBullets);
+
+    for (const [platform, phpMap] of platformGroups) {
+        lines.push(bulletPrefix(1) + platform);
+        for (const [php, libEntries] of phpMap) {
+            lines.push(bulletPrefix(2) + php);
+            for (const { lib, item } of libEntries) {
+                lines.push(bulletPrefix(3) + reformatCheckLeaf(item.text, lib));
+            }
+        }
+    }
+
+    if (lines.length === 0) return '';
+    return lines.join('\n');
 }
 
 /**

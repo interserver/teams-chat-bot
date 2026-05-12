@@ -194,6 +194,47 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         assert.equal(commentItems.length, 2, 'distinct comment ids → distinct bullets');
     });
 
+    it('renders structured check_run names as a platform → PHP → lib tree', () => {
+        const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
+        // A mix of "platform · PHP X.Y · lib" and "Test PHP X.Y · lib" names —
+        // both must end up in the right buckets.
+        const r2 = mergeGithubTrackable(r1, checkRunEnv('Windows · PHP 8.3 · candy-core', 'queued', '', '', 'https://example/win83/candy-core'));
+        const r3 = mergeGithubTrackable(r2, checkRunEnv('Windows · PHP 8.3 · sugar-prompt', 'queued', '', '', 'https://example/win83/sugar-prompt'));
+        const r4 = mergeGithubTrackable(r3, checkRunEnv('Windows · PHP 8.4 · candy-shell', 'queued', '', '', 'https://example/win84/candy-shell'));
+        const r5 = mergeGithubTrackable(r4, checkRunEnv('macOS · PHP 8.3 · candy-pty', 'queued', '', '', 'https://example/mac83/candy-pty'));
+        const r6 = mergeGithubTrackable(r5, checkRunEnv('Test PHP 8.4 · candy-vt', 'queued', '', '', 'https://example/test84/candy-vt'));
+        const r7 = mergeGithubTrackable(r6, checkRunEnv('Test PHP 8.3 · candy-mines', 'queued', '', '', 'https://example/test83/candy-mines'));
+
+        const lines = r7.text.split('\n');
+
+        // Platforms appear as level-1 bullets ` - Platform`.
+        assert.ok(lines.some(l => l === ' - Windows'), 'Windows platform group');
+        assert.ok(lines.some(l => l === ' - macOS'), 'macOS platform group');
+        assert.ok(lines.some(l => l === ' - Test'), 'Test platform group');
+
+        // PHP versions appear as level-2 bullets `  - PHP X.Y` under their platform.
+        assert.ok(lines.some(l => l === '  - PHP 8.3'), 'PHP 8.3 sub-group');
+        assert.ok(lines.some(l => l === '  - PHP 8.4'), 'PHP 8.4 sub-group');
+
+        // Leaf bullets carry just the lib name (not the full check_run name).
+        assert.ok(lines.some(l => l.startsWith('   - ⏳ **candy-core** Check queued')), 'candy-core leaf');
+        assert.ok(lines.some(l => l.startsWith('   - ⏳ **sugar-prompt** Check queued')), 'sugar-prompt leaf');
+        assert.ok(lines.some(l => l.startsWith('   - ⏳ **candy-pty** Check queued')), 'candy-pty leaf');
+        assert.ok(lines.some(l => l.startsWith('   - ⏳ **candy-vt** Check queued')), 'candy-vt leaf');
+
+        // The platform/version segments must NOT leak into leaf bullets.
+        assert.ok(!r7.text.includes('**Windows · PHP'), 'platform stripped from leaf names');
+        assert.ok(!r7.text.includes('**Test PHP'), '`Test PHP X.Y` prefix stripped from leaf names');
+    });
+
+    it('leaves a single-name check_run (no `·` separator) as a flat top-level bullet', () => {
+        const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
+        const r2 = mergeGithubTrackable(r1, checkRunEnv('build', 'completed', 'success'));
+        // No platform tree — just one flat bullet.
+        assert.ok(r2.text.includes(' - ✅ **build** Check success'));
+        assert.ok(!r2.text.includes('  - PHP'));
+    });
+
     it('groups appveyor status, push, and check_run for the same SHA into one message', () => {
         const r1 = mergeGithubTrackable(emptyRecent(), checkRunEnv('Excavate'));
         const r2 = mergeGithubTrackable(r1, pushEnv());
