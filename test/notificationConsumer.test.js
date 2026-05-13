@@ -193,6 +193,176 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         assert.ok(merged.text.includes(L1 + 'ℹ️ appveyor[bot] triggered'));
     });
 
+    it('keeps distinct pull_request actions for the same PR as separate bullets', () => {
+        // The same PR firing "opened" → "synchronize" → "closed" should
+        // produce a header (from opened) plus two bullets — one per action.
+        // Before the fix, all PR events of the same PR shared one identity,
+        // so each subsequent event overwrote the previous bullet instead of
+        // adding a new one.
+        function prEnv(action, headSha, message) {
+            return {
+                type: 'msg',
+                message,
+                extra: {
+                    event_type: 'pull_request',
+                    repo: 'detain/foo',
+                    _commit_sha: 'pr:detain/foo:42',
+                    dedup_key: 'github:pr:detain/foo:42',
+                    data: { action, pull_request: { number: 42, head: { sha: headSha } } }
+                }
+            };
+        }
+        const r1 = mergeGithubTrackable(emptyRecent(), prEnv('opened', 'aaaaaaa', '🔀 PR opened: detain/foo#42'));
+        const r2 = mergeGithubTrackable(r1, prEnv('synchronize', 'bbbbbbb', '🔁 PR synchronized: detain/foo#42'));
+        const r3 = mergeGithubTrackable(r2, prEnv('closed', 'ccccccc', '✅ PR closed: detain/foo#42'));
+
+        assert.equal(r3.header, '🔀 PR opened: detain/foo#42');
+        assert.equal(r3.items.length, 2, 'synchronize and closed should each have their own bullet');
+        const identities = r3.items.map(it => it.identity);
+        assert.deepEqual(
+            identities.sort(),
+            ['pr:detain/foo:42:closed:ccccccc', 'pr:detain/foo:42:synchronize:bbbbbbb'].sort()
+        );
+    });
+
+    it('condenses a PR sub-bullet when the parent already shows the description body', () => {
+        // The PHP producer emits the same multi-section body (## Summary /
+        // ## Test plan / commit list) for every PR action. When a "closed"
+        // event nests under an "opened" header that already carries that
+        // body, the sub-bullet must collapse to its first line — anything
+        // else duplicates the description under its own parent.
+        const verboseOpened =
+            '🔀 [detain](u) **opened** pull request [#415 …](u2) in [detain/sugarcraft](u3) (`feat` → `master`).\n\n' +
+            '> ## Summary\n\n- a thing\n- another thing\n\n## Test plan\n\n- ran tests';
+        const verboseClosed =
+            '🔀 [detain](u) **closed** pull request [#415 …](u2) in [detain/sugarcraft](u3) (`feat` → `master`). ✅ Merged.\n\n' +
+            '> ## Summary\n\n- a thing\n- another thing\n\n## Test plan\n\n- ran tests';
+
+        function prEnv(action, headSha, message) {
+            return {
+                type: 'msg',
+                message,
+                extra: {
+                    event_type: 'pull_request',
+                    repo: 'detain/sugarcraft',
+                    _commit_sha: 'pr:detain/sugarcraft:415',
+                    dedup_key: 'github:pr:detain/sugarcraft:415',
+                    data: { action, pull_request: { number: 415, head: { sha: headSha } } }
+                }
+            };
+        }
+
+        const r1 = mergeGithubTrackable(emptyRecent(), prEnv('opened', 'aaaaaaa', verboseOpened));
+        const r2 = mergeGithubTrackable(r1, prEnv('closed', 'bbbbbbb', verboseClosed));
+
+        const closedItems = r2.items.filter(it => it.text.includes('closed'));
+        assert.equal(closedItems.length, 1, 'exactly one bullet should carry the closed action');
+        assert.equal(r2.items.length, r1.items.length + 1,
+            'closed event must add exactly one item beyond what opened produced');
+
+        const closedText = closedItems[0].text;
+        assert.ok(closedText.includes('Merged'), 'bullet must keep the merged status');
+        assert.ok(!closedText.includes('## Summary'), 'bullet must NOT repeat the description body');
+        assert.ok(!closedText.includes('Test plan'), 'bullet must NOT repeat the test plan section');
+        assert.ok(!closedText.includes('\n'), 'bullet text must be a single line');
+    });
+
+    it('keeps a PR sub-bullet verbose when the parent does NOT carry its description', () => {
+        // Symmetric case: if a `closed` event arrives WITHOUT a matching
+        // `opened` parent (or with a different description body — someone
+        // edited the PR between actions), the reader needs the body to
+        // appear *somewhere*. The condensation must back off and keep
+        // the full verbose text in the bullet.
+        function prEnv(action, headSha, message) {
+            return {
+                type: 'msg',
+                message,
+                extra: {
+                    event_type: 'pull_request',
+                    repo: 'detain/sugarcraft',
+                    _commit_sha: 'pr:detain/sugarcraft:415',
+                    dedup_key: 'github:pr:detain/sugarcraft:415',
+                    data: { action, pull_request: { number: 415, head: { sha: headSha } } }
+                }
+            };
+        }
+
+        // Trackable seeded by an UNRELATED event (e.g. a workflow_job for
+        // the PR's branch). The header doesn't include the PR description.
+        const unrelatedRecent = {
+            header: '🔄 Workflow **CI** in_progress for detain/sugarcraft on `feat` (view run)',
+            items: [],
+            header_identity: 'workflow_job:CI'
+        };
+        const verboseClosed =
+            '🔀 [detain](u) **closed** pull request [#415 …](u2) in [detain/sugarcraft](u3) (`feat` → `master`). ✅ Merged.\n\n' +
+            '> ## Summary\n\n- a thing\n- another thing';
+
+        const merged = mergeGithubTrackable(unrelatedRecent, prEnv('closed', 'ccccccc', verboseClosed));
+        const closedItem = merged.items.find(it => it.text.includes('closed'));
+        assert.ok(closedItem, 'closed event should produce an item');
+        assert.ok(closedItem.text.includes('## Summary'),
+            'closed bullet must keep the description body when the parent does not show it');
+        assert.ok(closedItem.text.includes('a thing'));
+    });
+
+    it('keeps a PR sub-bullet verbose when the description was edited between events', () => {
+        // Same PR, different description bodies between opened and closed.
+        // The reader needs to see the new body in the closed bullet — the
+        // normalised-substring check in parentAlreadyShowsPrBody fails so
+        // condensation backs off and the verbose form is preserved.
+        function prEnv(action, headSha, message) {
+            return {
+                type: 'msg',
+                message,
+                extra: {
+                    event_type: 'pull_request',
+                    repo: 'detain/sugarcraft',
+                    _commit_sha: 'pr:detain/sugarcraft:415',
+                    dedup_key: 'github:pr:detain/sugarcraft:415',
+                    data: { action, pull_request: { number: 415, head: { sha: headSha } } }
+                }
+            };
+        }
+        const verboseOpenedOld =
+            '🔀 [detain](u) **opened** pull request [#415 …](u2) in [detain/sugarcraft](u3) (`feat` → `master`).\n\n' +
+            '> ## Summary\n\n- original description';
+        const verboseClosedNew =
+            '🔀 [detain](u) **closed** pull request [#415 …](u2) in [detain/sugarcraft](u3) (`feat` → `master`). ✅ Merged.\n\n' +
+            '> ## Summary\n\n- edited description with new content';
+
+        const r1 = mergeGithubTrackable(emptyRecent(), prEnv('opened', 'aaaaaaa', verboseOpenedOld));
+        const r2 = mergeGithubTrackable(r1, prEnv('closed', 'bbbbbbb', verboseClosedNew));
+
+        const closedItem = r2.items.find(it => it.text.includes('closed'));
+        assert.ok(closedItem, 'closed event should produce an item');
+        assert.ok(closedItem.text.includes('edited description'),
+            'closed bullet must show the edited description body');
+    });
+
+    it('dedupes re-delivery of the same pull_request event', () => {
+        // GitHub sometimes re-delivers an identical webhook. Same action +
+        // same head_sha → same identity → overwrite-in-place (idempotent).
+        function prEnv(action, headSha, message) {
+            return {
+                type: 'msg',
+                message,
+                extra: {
+                    event_type: 'pull_request',
+                    repo: 'detain/foo',
+                    _commit_sha: 'pr:detain/foo:42',
+                    dedup_key: 'github:pr:detain/foo:42',
+                    data: { action, pull_request: { number: 42, head: { sha: headSha } } }
+                }
+            };
+        }
+        const r1 = mergeGithubTrackable(emptyRecent(), prEnv('opened', 'aaaaaaa', '🔀 PR opened: detain/foo#42'));
+        const r2 = mergeGithubTrackable(r1, prEnv('synchronize', 'bbbbbbb', '🔁 PR synchronized: detain/foo#42'));
+        const r3 = mergeGithubTrackable(r2, prEnv('synchronize', 'bbbbbbb', '🔁 PR synchronized: detain/foo#42'));
+
+        assert.equal(r3.items.length, 1, 're-delivered synchronize must not spawn a duplicate bullet');
+    });
+
     it('keeps distinct pull_request_review_comment events as separate bullets', () => {
         // Two different PR review comments by the same bot produce the same
         // env.message text. Without per-comment identity they would collapse

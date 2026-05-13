@@ -133,7 +133,12 @@ describe('ticketQuick command', () => {
         assert.equal(m.dept, 'billing');
     });
     it('does not match unknown department', () => {
-        assert.equal(ticketQuick.match('add foo ticket bar', 'add foo ticket bar', { ima: 'admin' }), null);
+        // Invalid department returns { invalidDept } object, not null —
+        // this signals to execute() that it should show an error with the
+        // list of valid departments rather than submit a ticket.
+        const m = ticketQuick.match('add foo ticket bar', 'add foo ticket bar', { ima: 'admin' });
+        assert.ok(m);
+        assert.equal(m.invalidDept, 'foo');
     });
 });
 

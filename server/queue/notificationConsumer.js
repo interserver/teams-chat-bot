@@ -17,6 +17,7 @@ const { resolve: resolveChannel } = require('./channels');
 const { shouldSkip } = require('./filters');
 const { getAdapter } = require('../lib/adapter');
 const { createNotifRedis, createBotRedis, TEAMS_SERVICE_URL } = require('../lib/redis');
+const trace = require('./notifTrace');
 
 const POLL_INTERVAL_MS = parseInt(process.env.NOTIF_POLL_MS || '5000', 10);
 const POLL_INTERVAL_FAST_MS = parseInt(process.env.NOTIF_POLL_FAST_MS || '1000', 10);
@@ -36,6 +37,10 @@ function k(name) { return KEY_PREFIX + name; }
 function recentKey(room) { return k('recent:') + room; }
 function wfactiveKey(repo) { return k('wfactive:') + repo; }
 function metric(name) { return k('metrics:') + name; }
+// Branch → PR number index. Populated when a `pull_request` event arrives
+// so subsequent `push` and `delete` events on the same branch can be
+// rerouted into the PR's trackable instead of spawning their own messages.
+function prBranchKey(repo, branch) { return k('prbranch:') + repo + ':' + branch; }
 
 // ---------------------------------------------------------------------------
 // Action-triggered push attribution
@@ -187,6 +192,166 @@ async function findParentSha(env) {
 }
 
 // ---------------------------------------------------------------------------
+// Branch → PR routing
+// ---------------------------------------------------------------------------
+//
+// A PR's lifecycle generates events that GitHub never explicitly links back
+// to the PR: pushes to the PR branch arrive as plain `push` events, the
+// branch deletion after merge as a `delete` event, and PR-conversation
+// comments as `issue_comment` events. Without help, each of these spawns
+// its own trackable. We bridge the gap with:
+//
+//   1. A `notif:prbranch:{repo}:{branch}` key written whenever a
+//      `pull_request` event arrives, mapping the head branch back to the
+//      PR number for the same EDIT_WINDOW_MS (30 min) life as the PR's
+//      own trackable.
+//   2. `attachPrContext(env)` inspects each envelope after dedup
+//      normalisation and rewrites `dedup_key` / `_commit_sha` to the PR's
+//      scoped values when:
+//        - `issue_comment` event whose issue is actually a PR (per
+//          `issue.html_url` containing `/pull/{n}` or `issue.pull_request`
+//          set), even when the comment producer didn't tag it.
+//        - `push` or `delete` event for a branch in the prbranch index.
+//      It also rewrites the verbose message for `delete` so the user sees
+//      *what* was deleted, not just "triggered a delete event".
+
+async function recordPrBranch(repo, branch, prNumber) {
+    if (!redis || !repo || !branch || !prNumber) return;
+    try {
+        await redis.set(
+            prBranchKey(repo, branch),
+            String(prNumber),
+            'PX', EDIT_WINDOW_MS
+        );
+    } catch (err) {
+        console.warn(`[notif] recordPrBranch failed for ${ repo }/${ branch }: ${ err.message }`);
+    }
+}
+
+async function lookupPrByBranch(repo, branch) {
+    if (!redis || !repo || !branch) return null;
+    try {
+        const val = await redis.get(prBranchKey(repo, branch));
+        if (!val) return null;
+        const n = parseInt(val, 10);
+        return Number.isFinite(n) ? n : null;
+    } catch (err) {
+        console.warn(`[notif] lookupPrByBranch failed for ${ repo }/${ branch }: ${ err.message }`);
+        return null;
+    }
+}
+
+/** Pull the bare branch name out of a `refs/heads/...` ref string. */
+function branchFromRef(ref) {
+    return String(ref || '').replace(/^refs\/heads\//, '');
+}
+
+/**
+ * Pull the PR number out of a GitHub issue object that's actually a PR.
+ * GitHub normally sets `issue.pull_request` (an object with `url`,
+ * `html_url`, etc.) to mark PRs, but the producer occasionally drops that
+ * field; `issue.html_url` ending in `/pull/{n}` is the more reliable
+ * indicator. Returns null when the issue isn't a PR.
+ */
+function prNumberFromIssue(issue) {
+    if (!issue) return null;
+    if (issue.pull_request) return issue.number || null;
+    const m = String(issue.html_url || '').match(/\/pull\/(\d+)(?:[/?#]|$)/);
+    return m ? parseInt(m[1], 10) : null;
+}
+
+/**
+ * Reroute the envelope into a PR trackable when the event is implicitly
+ * tied to a PR. Mutates `env.extra` (and `env.message` for `delete`
+ * events). Returns a small descriptor that callers can use for tracing:
+ * `{ rerouted: bool, reason, pr_number }`.
+ */
+async function attachPrContext(env) {
+    const extra = env.extra = env.extra || {};
+    const data = extra.data || {};
+    const eventType = extra.event_type || '';
+    const repo = extra.repo || '';
+    if (!repo) return { rerouted: false };
+
+    // pull_request → seed the branch→PR index for future push/delete.
+    if (eventType === 'pull_request') {
+        const prNumber = data.pull_request?.number;
+        const headBranch = data.pull_request?.head?.ref;
+        if (prNumber && headBranch) {
+            await recordPrBranch(repo, headBranch, prNumber);
+        }
+        return { rerouted: false };
+    }
+
+    // issue_comment on a PR → route to the PR's trackable.
+    if (eventType === 'issue_comment') {
+        const prNumber = prNumberFromIssue(data.issue);
+        if (prNumber) {
+            extra.dedup_key = `github:pr:${ repo }:${ prNumber }`;
+            extra._commit_sha = `pr:${ repo }:${ prNumber }`;
+            return { rerouted: true, reason: 'issue_is_pr', pr_number: prNumber };
+        }
+        // Regular issue (not a PR) — still group multiple comments on the
+        // same issue together so they don't each spawn their own message.
+        const issueNumber = data.issue?.number;
+        if (issueNumber) {
+            extra.dedup_key = `github:issue:${ repo }:${ issueNumber }`;
+            extra._commit_sha = `issue:${ repo }:${ issueNumber }`;
+            return { rerouted: true, reason: 'group_by_issue', pr_number: null };
+        }
+        return { rerouted: false };
+    }
+
+    // create / delete → rewrite message to say *what* was created or
+    // deleted, and (for delete only — see note below) reroute to the
+    // PR's trackable if the branch was the head of a recent PR.
+    //
+    // For `create`: the PR-branch index isn't populated yet at create
+    // time (the create event fires when the branch first appears; the
+    // pull_request opened event arrives later), so a branch→PR lookup
+    // is normally a miss. We still try it for symmetry — if a PR
+    // somehow opened before the create event landed, the routing kicks
+    // in — but the main value here is the message rewrite.
+    if (eventType === 'create' || eventType === 'delete') {
+        const ref = data.ref || '';
+        const refType = data.ref_type || '';
+        const sender = data.sender?.login || 'someone';
+        const stubRe = new RegExp(`triggered\\s+a\\s+\\*?\\*?${ eventType }\\*?\\*?\\s+event`, 'i');
+        if (ref && refType && stubRe.test(env.message || '')) {
+            const verb = eventType === 'create' ? 'created' : 'deleted';
+            const emoji = eventType === 'create' ? '🌱' : '🗑️';
+            env.message = `${ emoji } ${ sender } ${ verb } ${ refType } \`${ ref }\` in [${ repo }](https://github.com/${ repo }).`;
+        }
+        if (refType === 'branch' && ref) {
+            const prNumber = await lookupPrByBranch(repo, ref);
+            if (prNumber) {
+                extra.dedup_key = `github:pr:${ repo }:${ prNumber }`;
+                extra._commit_sha = `pr:${ repo }:${ prNumber }`;
+                const reason = eventType === 'create' ? 'branch_became_pr_head' : 'branch_was_pr_head';
+                return { rerouted: true, reason, pr_number: prNumber };
+            }
+        }
+        return { rerouted: false };
+    }
+
+    // push to a PR branch → route to the PR trackable.
+    if (eventType === 'push') {
+        const branch = branchFromRef(data.ref);
+        if (branch) {
+            const prNumber = await lookupPrByBranch(repo, branch);
+            if (prNumber) {
+                extra.dedup_key = `github:pr:${ repo }:${ prNumber }`;
+                extra._commit_sha = `pr:${ repo }:${ prNumber }`;
+                return { rerouted: true, reason: 'branch_is_pr_head', pr_number: prNumber };
+            }
+        }
+        return { rerouted: false };
+    }
+
+    return { rerouted: false };
+}
+
+// ---------------------------------------------------------------------------
 // GitHub commit SHA extraction
 // ---------------------------------------------------------------------------
 
@@ -226,7 +391,8 @@ function extractCommitSha(env) {
     } else if (eventType === 'commit_comment') {
         sha = data.comment?.commit_id || null;
     } else if (eventType === 'pull_request') {
-        sha = data.pull_request?.merge_commit_sha || data.pull_request?.head?.sha || null;
+        // PR events are grouped by PR number, not commit SHA
+        sha = null;
     } else if (eventType === 'pull_request_review') {
         // PR reviews are anchored to the commit being reviewed (review.commit_id)
         // and fall back to the PR's current HEAD sha.
@@ -339,24 +505,57 @@ function elapsedMs(isoTimestamp) {
  */
 function normalizeGithubDedup(it) {
     const extra = it.env.extra = it.env.extra || {};
+    const data = extra.data || {};
     const eventType = extra.event_type || '';
 
-    // For all GitHub events that carry a commit SHA: ensure we have _commit_sha set
+    // pull_request events are grouped by PR number, not commit SHA.
+    // Handle this first since extractCommitSha returns null for PRs.
+    // We also set _commit_sha to a PR-scoped value so the isGithubAppend
+    // check in tryEdit works (it compares commit SHAs to decide whether
+    // to merge into existing trackable or use standard append mode).
+    if (eventType === 'pull_request') {
+        const prNumber = data.pull_request?.number;
+        const repo = extra.repo;
+        if (prNumber && repo) {
+            extra.dedup_key = `github:pr:${ repo }:${ prNumber }`;
+            // Set _commit_sha to a stable PR-scoped value so isGithubAppend
+            // in tryEdit is true for events in the same PR trackable.
+            extra._commit_sha = `pr:${ repo }:${ prNumber }`;
+        }
+        return;
+    }
+
+    // For all other GitHub events: ensure we have _commit_sha set
     // even if dedup_key was already set by PHP. This enables secondary SHA-based lookup.
     const sha = extractCommitSha(it.env);
     if (!sha) return; // no SHA — can't group
 
     extra._commit_sha = sha;
 
-    // For events that carry a commit SHA we always force the dedup key to
-    // be commit-scoped so that pushes, workflow events, status events and
-    // PR-review events for the same commit all merge into one trackable
-    // message. PHP-set dedup keys are intentionally overridden.
+    // pull_request_review and pull_request_review_comment events have a
+    // pull_request.number — if present, route them to the PR trackable
+    // instead of the commit trackable so they nest under the PR "opened"
+    // header rather than scattering across commit-based trackables.
+    if (eventType === 'pull_request_review' || eventType === 'pull_request_review_comment') {
+        const prNumber = data.pull_request?.number;
+        const repo = extra.repo;
+        if (prNumber && repo) {
+            extra.dedup_key = `github:pr:${ repo }:${ prNumber }`;
+            // Set _commit_sha to PR-scoped value so isGithubAppend works
+            extra._commit_sha = `pr:${ repo }:${ prNumber }`;
+        } else {
+            extra.dedup_key = `github:commit:${ sha }`;
+        }
+        return;
+    }
+
+    // For events that carry a commit SHA we force the dedup key to
+    // be commit-scoped so that pushes, workflow events, status events
+    // and PR-review events for the same commit all merge into one trackable.
     if (eventType === 'push' || eventType === 'workflow_job' ||
         eventType === 'check_run' || eventType === 'check_suite' ||
         eventType === 'workflow_run' || eventType === 'status' ||
-        eventType === 'pull_request' || eventType === 'pull_request_review' ||
-        eventType === 'pull_request_review_comment' || eventType === 'commit_comment') {
+        eventType === 'commit_comment') {
         extra.dedup_key = `github:commit:${ sha }`;
         return;
     }
@@ -429,7 +628,42 @@ function jobIdentity(env) {
         const id = data.comment?.id;
         return id ? `commit_comment:${ id }` : null;
     }
+    if (eventType === 'pull_request') {
+        // PRs use prIdentity for grouping - each PR action (opened, closed,
+        // synchronize, etc.) is a distinct event that should be a sub-bullet
+        // under the PR header, not a header update. jobIdentity returning
+        // prIdentity enables re-delivery detection via the headerIdentity
+        // check at line 945, while the isPullRequest check ensures we
+        // always append as sub-bullet rather than updating the header.
+        return prIdentity(env);
+    }
     return null;
+}
+
+/**
+ * Per-event identity for `pull_request` events. Distinct per action +
+ * head_sha so each PR action (opened, synchronize, closed, reopened…)
+ * occupies its own slot in items[], while re-delivery of the same event
+ * is deduped (same action + same head_sha → same identity → in-place
+ * overwrite with identical text).
+ *
+ * The trackable as a whole is held together by `dedup_key`
+ * (`github:pr:{repo}:{number}`) and `_commit_sha` (`pr:{repo}:{number}`)
+ * — both PR-scoped — so all events for the same PR land in the same
+ * trackable. This identity only determines which bullet within that
+ * trackable an event maps to.
+ */
+function prIdentity(env) {
+    const extra = env.extra || {};
+    const data = extra.data || {};
+    const eventType = extra.event_type || '';
+    if (eventType !== 'pull_request') return null;
+    const prNumber = data.pull_request?.number;
+    const repo = extra.repo;
+    if (!prNumber || !repo) return null;
+    const action = data.action || 'unknown';
+    const headSha = (data.pull_request?.head?.sha || '').slice(0, 7) || 'nosha';
+    return `pr:${ repo }:${ prNumber }:${ action }:${ headSha }`;
 }
 
 /**
@@ -490,6 +724,19 @@ function condensedBulletText(env) {
         const url = wj.html_url || '';
         const link = url ? ` ([view run](${ url } "${ url }"))` : '';
         return `${ emoji } **${ name }** Workflow ${ statusText }${ link }`;
+    }
+    if (eventType === 'pull_request') {
+        // PR event bodies (## Summary / ## Test plan / commit list) are the
+        // PR *description*, which is identical across opened / synchronize /
+        // closed events for the same PR. The header already shows it once;
+        // sub-bullets only need the first line — the verb + actor + PR
+        // title + branches + (✅ Merged.) state — so a closed-after-opened
+        // bullet doesn't duplicate the full description body underneath
+        // its own parent.
+        const firstLine = String(env.message || '')
+            .split('\n')
+            .find(l => l.trim().length > 0);
+        return firstLine ? firstLine.trim() : null;
     }
     return null;
 }
@@ -856,6 +1103,54 @@ function splitHeaderAndBullets(text) {
 }
 
 /**
+ * Return everything after the first non-empty line of a PR event's
+ * verbose message. The first line is the verb + actor + PR title + branch
+ * pair (which varies per action: opened, closed, synchronize…); the rest
+ * is the PR description body (## Summary, ## Test plan, commit list) and
+ * is identical across every event of the same PR.
+ */
+function prBodyAfterFirstLine(text) {
+    const lines = String(text || '').split('\n');
+    let foundFirst = false;
+    const body = [];
+    for (const line of lines) {
+        if (!foundFirst) {
+            if (line.trim().length > 0) foundFirst = true;
+            continue;
+        }
+        body.push(line);
+    }
+    return body.join('\n').trim();
+}
+
+/**
+ * Decide whether a PR sub-bullet's body is already shown elsewhere in
+ * the trackable (in the header or as items extracted from a prior PR
+ * event's split). When true, the caller can safely condense the bullet
+ * to its first line so a `closed` sub-bullet under an `opened` header
+ * doesn't duplicate the description body.
+ *
+ * We compare on whitespace-collapsed, bullet-marker-stripped text so
+ * cosmetic differences (extra blank lines, the `- ` prefix that
+ * splitHeaderAndBullets strips, trailing spaces) don't defeat the match.
+ * If the body has been edited between events, normalised strings won't
+ * match and the caller falls back to the verbose form — preserving the
+ * new content for the reader.
+ */
+function parentAlreadyShowsPrBody(env, header, items) {
+    if ((env.extra || {}).event_type !== 'pull_request') return false;
+    const body = prBodyAfterFirstLine(env.message || '');
+    if (!body) return false;
+    const stored = [header, ...items.map(it => (it && it.text) || '')].join('\n');
+    const norm = s => String(s)
+        .split('\n')
+        .map(l => l.replace(/^[ \t]*[•*\-][ \t]+/, '').trim())
+        .filter(l => l)
+        .join(' ');
+    return norm(stored).includes(norm(body));
+}
+
+/**
  * Merge an incoming envelope into an existing trackable message.
  *
  *   recent — either the full recent object (with `header`, `items`,
@@ -878,13 +1173,30 @@ function mergeGithubTrackable(recent, env) {
     // message — fall back to env.message when there is no condensed form.
     const verboseMessage = String(env.message || '').trim();
     const condensed = condensedBulletText(env);
-    const bulletMessage = condensed || verboseMessage;
     const headerMessage = verboseMessage || condensed;
     const incomingIdentity = jobIdentity(env);
 
     let header = recentObj.header || recentObj.text || '';
     let items = Array.isArray(recentObj.items) ? recentObj.items.map(it => ({ ...it })) : [];
     let headerIdentity = recentObj.header_identity || null;
+
+    // Choose the bullet text. For most event types we always prefer the
+    // condensed form (check_run/workflow_job have noisy verbose text and
+    // the condensed line is strictly better). For `pull_request` events,
+    // the condensed form drops the PR description body — safe only when
+    // the parent already shows it. If the trackable doesn't carry the
+    // body yet (this is the first event, or the PR description was
+    // edited between events), keep the verbose text so the reader sees
+    // it instead of a content-less stub.
+    const eventType = (env.extra || {}).event_type || '';
+    let bulletMessage;
+    if (eventType === 'pull_request' && condensed) {
+        bulletMessage = parentAlreadyShowsPrBody(env, header, items)
+            ? condensed
+            : verboseMessage;
+    } else {
+        bulletMessage = condensed || verboseMessage;
+    }
 
     // First event for this commit becomes the header. If the verbose
     // message already contains its own bullet list (push events emit one
@@ -908,6 +1220,13 @@ function mergeGithubTrackable(recent, env) {
     // Same identity as the header → in-place update of the header (e.g.
     // check_run "Excavate" queued → in_progress → success edits the header
     // rather than appending a new bullet for each transition).
+    //
+    // For pull_request events this only fires on webhook re-delivery (same
+    // action + same head SHA → same identity), which is the exact case
+    // where overwriting the header with the identical text is correct. A
+    // *different* PR action (synchronize after opened, etc.) gets its own
+    // identity from prIdentity() and falls through to the bullet-append
+    // branch below.
     if (incomingIdentity && headerIdentity && incomingIdentity === headerIdentity) {
         if (headerMessage) header = headerMessage;
         return { text: renderTrackable(header, items), header, items, header_identity: headerIdentity };
@@ -965,6 +1284,9 @@ let redis = null;
 // existing bot Redis (Dragonfly, possibly behind auth) and we need it to
 // resolve where to send proactive activities.
 let redisBot = null;
+// Bot Framework adapter — assigned in startConsumer() from getAdapter().
+// Declared explicitly so the assignment doesn't create an implicit global.
+let adapter = null;
 
 function startConsumer() {
     if (timer) return;
@@ -1039,6 +1361,7 @@ async function runTick() {
     tickInFlight = true;
     const t0 = Date.now();
     totalTicks++;
+    const tickNum = trace.newTick();
     const stats = { drained: 0, sent: 0, edited: 0, coalesced: 0, fallback: 0, dead: 0, expired: 0, redirected: 0 };
     try {
         // Recover anything left over from a prior crashed tick BEFORE we drain new items.
@@ -1067,10 +1390,27 @@ async function runTick() {
         }
         stats.drained = items.length;
         console.log(`[notif] picked up ${ items.length } item(s) from ${ k('queue') }`);
+        trace.emit('drained', {
+            count: items.length,
+            queue_key: k('queue'),
+            order: items.map((it, idx) => ({
+                idx,
+                room: it.env.room,
+                type: it.env.type,
+                event_type: it.env.extra?.event_type,
+                dedup_key: it.env.extra?.dedup_key,
+                repo: it.env.extra?.repo,
+                _commit_sha: it.env.extra?._commit_sha
+            }))
+        });
         for (const it of items) {
             const ev = (it.env.extra && it.env.extra.event_type) ? ` ev=${ it.env.extra.event_type }` : '';
             const dk = (it.env.extra && it.env.extra.dedup_key) ? ` dedup=${ it.env.extra.dedup_key }` : '';
             console.log(`[notif]   • room=${ it.env.room } type=${ it.env.type }${ ev }${ dk } msg="${ preview(it.env.message) }"`);
+            trace.emit('item_drained', {
+                room: it.env.room,
+                envelope: trace.snapshotEnvelope(it.env)
+            });
         }
 
         const valid = [];
@@ -1078,6 +1418,12 @@ async function runTick() {
         for (const it of items) {
             if (it.env.expires_at && it.env.expires_at < nowSec) {
                 stats.expired++;
+                trace.emit('expired', {
+                    room: it.env.room,
+                    expires_at: it.env.expires_at,
+                    now_sec: nowSec,
+                    envelope: trace.snapshotEnvelope(it.env)
+                });
                 await deadLetter(it, 'expired');
                 continue;
             }
@@ -1091,11 +1437,22 @@ async function runTick() {
                 if (skipReason) {
                     if (skipReason === '__SILENT__') {
                         // Truly silent skip - just ack and don't send anywhere
+                        trace.emit('filter_silent', {
+                            room: it.env.room,
+                            event_type: it.env.extra?.event_type,
+                            envelope: trace.snapshotEnvelope(it.env)
+                        });
                         await ackOne(it);
                         stats.redirected = (stats.redirected || 0) + 1;
                         await bumpMetric('redirected');
                         continue;
                     }
+                    trace.emit('filter_redirect', {
+                        from_room: it.env.room,
+                        to_room: 'int-dev-announce',
+                        reason: skipReason,
+                        event_type: it.env.extra?.event_type
+                    });
                     redirectToAnnounce(it, skipReason);
                     stats.redirected = (stats.redirected || 0) + 1;
                     await bumpMetric('redirected');
@@ -1103,12 +1460,29 @@ async function runTick() {
             }
             // Route specific repos to int-dev-announce. This is in addition
             // to (and takes precedence over) the filter-based redirect.
+            // Supports wildcard patterns like "detain/*" to match all repos under
+            // an org, or exact repo names like "owner/repo".
             const announceRepos = (process.env.NOTIF_ANNOUNCE_REPOS || '')
                 .split(',')
                 .map(s => s.trim())
                 .filter(Boolean);
-            if (announceRepos.includes(it.env.extra?.repo || '')) {
+            const repo = it.env.extra?.repo || '';
+            const matchesAnnounce = announceRepos.some(pattern => {
+                if (pattern.endsWith('/*')) {
+                    // Wildcard pattern: matches "owner/repo" if pattern is "owner/*"
+                    const prefix = pattern.slice(0, -2);
+                    return repo.startsWith(prefix + '/') || repo === prefix;
+                }
+                return repo === pattern;
+            });
+            if (matchesAnnounce) {
                 const originalRoom = it.env.room || 'unknown';
+                trace.emit('announce_redirect', {
+                    from_room: originalRoom,
+                    to_room: 'int-dev-announce',
+                    repo: it.env.extra?.repo,
+                    matched_patterns: announceRepos
+                });
                 it.env.room = 'int-dev-announce';
                 if (!it.env.extra) it.env.extra = {};
                 it.env.extra.announce_redirect = true;
@@ -1117,15 +1491,53 @@ async function runTick() {
             // Auto-group GitHub events by commit SHA: inject a dedup_key so
             // the first event creates the trackable message and subsequent
             // job statuses for the same SHA edit it in-place.
+            const beforeKey = it.env.extra?.dedup_key;
+            const beforeSha = it.env.extra?._commit_sha;
             normalizeGithubDedup(it);
+            const afterKey = it.env.extra?.dedup_key;
+            const afterSha = it.env.extra?._commit_sha;
+            if (beforeKey !== afterKey || beforeSha !== afterSha) {
+                trace.emit('normalize', {
+                    room: it.env.room,
+                    event_type: it.env.extra?.event_type,
+                    before: { dedup_key: beforeKey, _commit_sha: beforeSha },
+                    after: { dedup_key: afterKey, _commit_sha: afterSha }
+                });
+            }
+            // PR-context attachment: reroute push/delete/issue_comment into
+            // the PR's trackable when applicable, and seed the branch→PR
+            // index when a pull_request event arrives. Also rewrites the
+            // delete event's verbose message to say what was deleted.
+            const beforePrKey = it.env.extra?.dedup_key;
+            const beforePrSha = it.env.extra?._commit_sha;
+            const prContext = await attachPrContext(it.env);
+            if (prContext.rerouted) {
+                trace.emit('pr_context_attached', {
+                    room: it.env.room,
+                    event_type: it.env.extra?.event_type,
+                    reason: prContext.reason,
+                    pr_number: prContext.pr_number,
+                    before: { dedup_key: beforePrKey, _commit_sha: beforePrSha },
+                    after: { dedup_key: it.env.extra?.dedup_key, _commit_sha: it.env.extra?._commit_sha }
+                });
+            }
             // Workflow-flavoured events also seed the per-repo active-workflow
             // index so a later bot/downstream push can look up its parent.
             await recordActiveWorkflow(it.env);
+            if (WORKFLOW_EVENT_TYPES.has(it.env.extra?.event_type || '') && it.env.extra?._commit_sha) {
+                trace.emit('wfactive_record', {
+                    repo: it.env.extra.repo,
+                    commit_sha: it.env.extra._commit_sha,
+                    event_type: it.env.extra.event_type
+                });
+            }
             // Action-triggered child pushes (vhs commit, sync-sugarcraft
             // subtree pushes, etc.) get re-keyed onto the parent's dedup_key
             // so they nest under the existing trackable instead of spawning
-            // a new message.
-            if (isActionTriggeredPush(it.env)) {
+            // a new message. PR-branch routing already won above for pushes
+            // to PR head branches, so don't double-rewrite.
+            const alreadyPrRouted = (it.env.extra?.dedup_key || '').startsWith('github:pr:');
+            if (!alreadyPrRouted && isActionTriggeredPush(it.env)) {
                 const parentSha = await findParentSha(it.env);
                 if (parentSha && parentSha !== it.env.extra._commit_sha) {
                     const ownSha = it.env.extra._commit_sha;
@@ -1133,6 +1545,12 @@ async function runTick() {
                     it.env.extra._commit_sha = parentSha;
                     it.env.extra.dedup_key = `github:commit:${ parentSha }`;
                     console.log(`[notif]   ↳ attributing ${ it.env.extra.repo }@${ ownSha } to parent ${ parentSha } (action-triggered)`);
+                    trace.emit('action_triggered_attribution', {
+                        repo: it.env.extra.repo,
+                        own_sha: ownSha,
+                        parent_sha: parentSha,
+                        new_dedup_key: it.env.extra.dedup_key
+                    });
                 }
             }
             valid.push(it);
@@ -1153,6 +1571,7 @@ async function runTick() {
         const ms = Date.now() - t0;
         if (stats.drained > 0) {
             console.log(`[notif] tick drained=${ stats.drained } sent=${ stats.sent } edited=${ stats.edited } coalesced=${ stats.coalesced } redirected=${ stats.redirected } fallback=${ stats.fallback } dead=${ stats.dead } expired=${ stats.expired } ms=${ ms }`);
+            trace.emit('tick_end', { stats: { ...stats }, ms });
             scheduleNextTick(POLL_INTERVAL_FAST_MS);
         } else {
             scheduleNextTick(POLL_INTERVAL_MS);
@@ -1205,6 +1624,13 @@ async function processRoom(room, batch, stats) {
         if (it.env.extra && it.env.extra.dedup_key) trackable.push(it);
         else coalescable.push(it);
     }
+    trace.emit('route', {
+        room,
+        batch_size: batch.length,
+        trackable_count: trackable.length,
+        coalescable_count: coalescable.length,
+        trackable_keys: trackable.map(it => it.env.extra?.dedup_key)
+    });
 
     // 1. Trackable items: try to edit existing recent activity, else new send.
     // Calls are awaited sequentially so when several events for the same
@@ -1225,12 +1651,13 @@ async function processRoom(room, batch, stats) {
 
 async function handleTrackable(room, it, stats) {
     let recent = null;
+    let recentSource = null;
     const dedupKey = it.env.extra.dedup_key;
 
     // Primary lookup by dedup_key
     try {
         const raw = await redis.hget(recentKey(room), dedupKey);
-        if (raw) recent = JSON.parse(raw);
+        if (raw) { recent = JSON.parse(raw); recentSource = 'dedup_key'; }
     } catch (err) {
         console.warn('[notif] hget failed:', err.message);
     }
@@ -1244,45 +1671,82 @@ async function handleTrackable(room, it, stats) {
         try {
             const shaBasedKey = `github:commit:${ it.env.extra._commit_sha }`;
             const raw = await redis.hget(recentKey(room), shaBasedKey);
-            if (raw) recent = JSON.parse(raw);
+            if (raw) { recent = JSON.parse(raw); recentSource = 'commit_sha_fallback'; }
         } catch (err) {
             console.warn('[notif] hget sha-based lookup failed:', err.message);
         }
     }
 
-    if (recent && recent.activityId && (Date.now() - recent.ts < EDIT_WINDOW_MS) && recent.type === it.env.type) {
+    const ageMs = recent ? Date.now() - recent.ts : null;
+    const inWindow = recent && recent.activityId && ageMs < EDIT_WINDOW_MS && recent.type === it.env.type;
+    trace.emit('recent_lookup', {
+        room,
+        dedup_key: dedupKey,
+        commit_sha: it.env.extra._commit_sha,
+        event_type: it.env.extra.event_type,
+        found: !!recent,
+        source: recentSource,
+        age_ms: ageMs,
+        edit_window_ms: EDIT_WINDOW_MS,
+        eligible_for_edit: !!inWindow,
+        recent: trace.snapshotRecent(recent)
+    });
+
+    if (inWindow) {
         const ok = await tryEdit(room, it, recent, stats);
         if (ok) {
             await ackOne(it);
             return;
         }
         // Edit failed → fall through to new send (overwrite cache)
+        trace.emit('edit_fell_through', { room, dedup_key: dedupKey });
     }
 
     await handleSingleNew(room, it, stats);
 }
 
 async function tryEdit(room, it, recent, stats) {
-    const conversationRef = await loadConvRef(recent.conversationId);
-    if (!conversationRef) return false;
-    console.log(`[notif] ✎ edit room=${ room } conv=${ shortConv(recent.conversationId) } activity=${ recent.activityId } dedup=${ it.env.extra.dedup_key } "${ preview(it.env.message) }"`);
+    let conversationRef = await loadConvRef(recent.conversationId);
+    let usedConstructed = false;
+    if (!conversationRef) {
+        // Stored convref missing — happens when `handleSingleNew` sent the
+        // initial activity via `tryConstructedConvRef` (the bot has never
+        // received an inbound message in that channel), so no real
+        // `convref:{conversationId}` was ever written to Redis. The very
+        // case we need to support: a PR fires multiple events in the same
+        // tick, the first lands via constructed ref, and every subsequent
+        // event arrives here. Without this fallback, every edit silently
+        // bails to `handleSingleNew` and spawns a new top-level message
+        // — which is exactly what was producing un-grouped PR notifications.
+        conversationRef = buildConstructedConvRef(room, recent.conversationId);
+        usedConstructed = true;
+        trace.emit('edit_using_constructed_convref', {
+            room,
+            conversation_id: recent.conversationId,
+            dedup_key: it.env.extra.dedup_key
+        });
+    }
+    console.log(`[notif] ✎ edit room=${ room } conv=${ shortConv(recent.conversationId) } activity=${ recent.activityId } dedup=${ it.env.extra.dedup_key }${ usedConstructed ? ' [constructed]' : '' } "${ preview(it.env.message) }"`);
 
     let newText, newCard;
     let newHeader = recent.header || null;
     let newItems = Array.isArray(recent.items) ? recent.items : null;
     let newHeaderIdentity = recent.header_identity || null;
+    let mergeMode = null;
     if (it.env.type === 'msg') {
         const recentSha = recent.commit_sha || null;
         const currentSha = it.env.extra && it.env.extra._commit_sha ? it.env.extra._commit_sha : null;
         const isGithubAppend = recentSha && currentSha && recentSha === currentSha;
 
         if (isGithubAppend) {
+            mergeMode = 'github_trackable';
             const merged = mergeGithubTrackable(recent, it.env);
             newText = merged.text;
             newHeader = merged.header;
             newItems = merged.items;
             newHeaderIdentity = merged.header_identity;
         } else {
+            mergeMode = 'standard_append';
             // ── Standard append mode (non-GitHub or different commit) ──────
             const appended = (recent.appended_count || 0) + 1;
             if (appended <= APPEND_TRAIL_SUMMARY_AFTER) {
@@ -1295,8 +1759,31 @@ async function tryEdit(room, it, recent, stats) {
             }
         }
     } else {
+        mergeMode = 'card_replace';
         newCard = Array.isArray(it.env.card) ? it.env.card : [it.env.card];
     }
+
+    trace.emit('edit_merge', {
+        room,
+        activity_id: recent.activityId,
+        conversation_id: recent.conversationId,
+        dedup_key: it.env.extra.dedup_key,
+        merge_mode: mergeMode,
+        before: {
+            text: recent.text,
+            header: recent.header,
+            items: recent.items,
+            header_identity: recent.header_identity,
+            commit_sha: recent.commit_sha
+        },
+        after: {
+            text: newText,
+            header: newHeader,
+            items: newItems,
+            header_identity: newHeaderIdentity
+        },
+        incoming: trace.snapshotEnvelope(it.env)
+    });
 
     try {
         await runWithRetry(async () => {
@@ -1313,9 +1800,21 @@ async function tryEdit(room, it, recent, stats) {
         });
     } catch (err) {
         console.warn(`[notif] edit failed for ${ room }/${ it.env.extra.dedup_key }: ${ err.message }`);
+        trace.emit('edit_failed', {
+            room,
+            activity_id: recent.activityId,
+            dedup_key: it.env.extra.dedup_key,
+            error: err.message
+        });
         await bumpMetric('edit_failed');
         return false;
     }
+    trace.emit('edit_ok', {
+        room,
+        activity_id: recent.activityId,
+        dedup_key: it.env.extra.dedup_key,
+        appended_count: (recent.appended_count || 0) + 1
+    });
 
     const updated = {
         activityId: recent.activityId,
@@ -1404,6 +1903,13 @@ async function handleSingleNew(room, it, stats) {
 
     const previewText = it.env.type === 'card' ? `[card ×${ Array.isArray(it.env.card) ? it.env.card.length : 1 }]` : preview(it.env.message);
     console.log(`[notif] → send room=${ room } conv=${ shortConv(conversationId) } "${ previewText }"`);
+    trace.emit('send_attempt', {
+        room,
+        conversation_id: conversationId,
+        dedup_key: it.env.extra?.dedup_key,
+        type: it.env.type,
+        text: it.env.type === 'msg' ? it.env.message : undefined
+    });
     let activityId = null;
     try {
         await runWithRetry(async () => {
@@ -1418,10 +1924,17 @@ async function handleSingleNew(room, it, stats) {
         });
     } catch (err) {
         console.warn(`[notif] send failed for ${ room }: ${ err.message }`);
+        trace.emit('send_failed', { room, conversation_id: conversationId, error: err.message });
         await fallbackSend(room, [it], stats, 'send_failed:' + err.message);
         return;
     }
     console.log(`[notif]   sent room=${ room } activity=${ activityId || '<none>' }`);
+    trace.emit('send_ok', {
+        room,
+        conversation_id: conversationId,
+        activity_id: activityId,
+        dedup_key: it.env.extra?.dedup_key
+    });
 
     if (activityId && it.env.extra && it.env.extra.dedup_key) {
         const initial = initialTrackableState(it.env);
@@ -1507,6 +2020,10 @@ async function sendCombinedText(room, conversationRef, msgItems, stats) {
         }
     }
     console.log(`[notif] ⊕ coalesce(text) room=${ room } items=${ included }${ leftover.length ? ' leftover=' + leftover.length : '' } "${ preview(combined) }"`);
+    trace.emit('coalesce_text_attempt', {
+        room, items_in: included, leftover: leftover.length,
+        bytes: combined.length, text: combined
+    });
     try {
         await runWithRetry(async () => {
             await adapter.continueConversation(conversationRef, async (proactiveContext) => {
@@ -1515,11 +2032,13 @@ async function sendCombinedText(room, conversationRef, msgItems, stats) {
         }, { label: `notif coalesce ${ room }`, serviceUrl: conversationRef.serviceUrl, maxRetries: 3 });
     } catch (err) {
         console.warn(`[notif] coalesced send failed for ${ room }: ${ err.message }`);
+        trace.emit('coalesce_text_failed', { room, error: err.message });
         await fallbackSend(room, msgItems.slice(0, included), stats, 'send_failed:' + err.message);
         for (const it of leftover) await fallbackSend(room, [it], stats, 'leftover_after_failure');
         return;
     }
     console.log(`[notif]   sent (coalesced) room=${ room } items=${ included }`);
+    trace.emit('coalesce_text_ok', { room, items_in: included });
     stats.sent++;
     stats.coalesced += included;
     await bumpMetric('coalesced');
@@ -1571,6 +2090,7 @@ async function fallbackSend(room, items, stats, reason) {
         const url = it.env.fallback_webhook_url;
         if (!url) {
             console.warn(`[notif] ⤳ fallback abandoned room=${ room } reason=${ reason }_no_fallback`);
+            trace.emit('fallback_abandoned', { room, reason: `${ reason }_no_fallback`, envelope: trace.snapshotEnvelope(it.env) });
             await deadLetter(it, `${ reason }_no_fallback`);
             stats.dead++;
             continue;
@@ -1578,6 +2098,7 @@ async function fallbackSend(room, items, stats, reason) {
         const urlHost = (() => { try { return new URL(url).host; } catch (_) { return 'unknown'; } })();
         const previewText = it.env.type === 'card' ? `[card ×${ Array.isArray(it.env.card) ? it.env.card.length : 1 }]` : preview(it.env.message);
         console.log(`[notif] ⤳ fallback room=${ room } host=${ urlHost } reason=${ reason } "${ previewText }"`);
+        trace.emit('fallback_attempt', { room, url_host: urlHost, reason });
         try {
             const body = it.env.type === 'card'
                 ? {
@@ -1590,11 +2111,13 @@ async function fallbackSend(room, items, stats, reason) {
                 : { type: 'message', message: it.env.message || '' };
             await axios.post(url, body, { timeout: 30000 });
             console.log(`[notif]   fallback OK room=${ room }`);
+            trace.emit('fallback_ok', { room, url_host: urlHost });
             stats.fallback++;
             await bumpMetric('fallback');
             await ackOne(it);
         } catch (err) {
             console.error(`[notif fallback] webhook POST failed for ${ room }: ${ err.message }`);
+            trace.emit('fallback_failed', { room, url_host: urlHost, error: err.message });
             await deadLetter(it, `fallback_failed:${ err.message }`);
             stats.dead++;
             await bumpMetric('fallback_failed');
@@ -1618,6 +2141,12 @@ async function deadLetter(it, reason) {
             .ltrim(k('dead'), 0, 999)
             .lrem(k('processing'), 1, it.raw)
             .exec();
+        trace.emit('dead_lettered', {
+            room: it.env.room,
+            reason,
+            dedup_key: it.env.extra?.dedup_key,
+            event_type: it.env.extra?.event_type
+        });
         await bumpMetric('dead');
     } catch (err) {
         console.error('[notif] deadLetter failed:', err.message);
@@ -1671,22 +2200,19 @@ async function loadConvRef(conversationId) {
     }
 }
 
-// Try to send via Bot Framework using a constructed ConversationReference.
-// This is a fallback when loadConvRef returns null (e.g., bot was installed
-// before onInstallationUpdateAdd started capturing convrefs).
-// Returns true if successful, false otherwise.
-async function tryConstructedConvRef(room, conversationId, activity, stats) {
-    // Use configurable service URL (supports GCC/GCC High via TEAMS_SERVICE_URL env var)
-    const SERVICE_URL = TEAMS_SERVICE_URL;
-
-    // Construct a minimal ConversationReference with what we know.
-    // The key fields needed are serviceUrl and conversation.id.
-    // aadObjectId and tenantId are used for bot identity - use env values if available.
-    const constructedRef = {
-        serviceUrl: SERVICE_URL,
+// Build a minimal ConversationReference from just a room name + conversation
+// ID. Used both for first-send fallback (`tryConstructedConvRef`) and for
+// edit fallback (`tryEdit`) when `loadConvRef` returns null because the bot
+// has never observed an inbound activity in that channel.
+//
+// The key fields needed are `serviceUrl` and `conversation.id`. `aadObjectId`
+// and `tenantId` are used for bot identity — read from env when set.
+function buildConstructedConvRef(room, conversationId) {
+    return {
+        serviceUrl: TEAMS_SERVICE_URL,
         conversation: {
             id: conversationId,
-            name: room,  // use the actual room name, not a hardcoded value
+            name: room,
             isGroup: true
         },
         aadObjectId: process.env.BOT_AAD_OBJECT_ID || 'unknown',
@@ -1696,10 +2222,18 @@ async function tryConstructedConvRef(room, conversationId, activity, stats) {
             name: 'teams-chat-bot'
         },
         channelId: 'msteams',
-        _constructed: true  // marker for debugging
+        _constructed: true
     };
+}
 
-    console.log(`[notif] → trying constructed convref room=${ room } conv=${ shortConv(conversationId) } serviceUrl=${ SERVICE_URL }`);
+// Try to send via Bot Framework using a constructed ConversationReference.
+// This is a fallback when loadConvRef returns null (e.g., bot was installed
+// before onInstallationUpdateAdd started capturing convrefs).
+// Returns the new activity id on success, null on failure.
+async function tryConstructedConvRef(room, conversationId, activity, stats) {
+    const constructedRef = buildConstructedConvRef(room, conversationId);
+    console.log(`[notif] → trying constructed convref room=${ room } conv=${ shortConv(conversationId) } serviceUrl=${ TEAMS_SERVICE_URL }`);
+    trace.emit('constructed_convref_attempt', { room, conversation_id: conversationId, op: 'send' });
     let activityId = null;
     try {
         await runWithRetry(async () => {
@@ -1709,13 +2243,15 @@ async function tryConstructedConvRef(room, conversationId, activity, stats) {
             });
         }, {
             label: `notif constructed-ref ${ room }`,
-            serviceUrl: SERVICE_URL,
+            serviceUrl: TEAMS_SERVICE_URL,
             maxRetries: 2
         });
         console.log(`[notif]   constructed-convref success room=${ room } activity=${ activityId || '<none>' }`);
+        trace.emit('constructed_convref_ok', { room, conversation_id: conversationId, op: 'send', activity_id: activityId });
         return activityId;
     } catch (err) {
         console.warn(`[notif] constructed-convref failed for ${ room }: ${ err.message }`);
+        trace.emit('constructed_convref_failed', { room, conversation_id: conversationId, op: 'send', error: err.message });
         return null;
     }
 }
@@ -1726,6 +2262,15 @@ async function saveRecent(room, dedupKey, value) {
         pipe.hset(recentKey(room), dedupKey, JSON.stringify(value));
         pipe.expire(recentKey(room), Math.ceil(EDIT_WINDOW_MS / 1000));
         await pipe.exec();
+        trace.emit('recent_saved', {
+            room,
+            dedup_key: dedupKey,
+            activity_id: value.activityId,
+            commit_sha: value.commit_sha,
+            appended_count: value.appended_count,
+            header_identity: value.header_identity,
+            item_count: Array.isArray(value.items) ? value.items.length : 0
+        });
     } catch (err) {
         console.warn('[notif] saveRecent failed:', err.message);
     }
@@ -1772,11 +2317,28 @@ async function getHealth() {
     }
 }
 
+// Test-only injection seam. Lets tests substitute mock redis / redisBot /
+// adapter handles so the handleTrackable / tryEdit / handleSingleNew paths
+// can be driven without a live Redis or Bot Framework adapter. Returns the
+// prior values so a test can restore them in an `after` hook.
+function _setInternalsForTest(overrides = {}) {
+    const prev = { redis, redisBot, adapter };
+    if ('redis' in overrides) redis = overrides.redis;
+    if ('redisBot' in overrides) redisBot = overrides.redisBot;
+    if ('adapter' in overrides) adapter = overrides.adapter;
+    return prev;
+}
+
 module.exports = {
     startConsumer, stopConsumer, getHealth, runTick, getNotifRedis,
     mergeGithubTrackable,
     // exported for !notif wfactive and tests
     parseDownstreamMap, isActionTriggeredPush, findParentSha, recordActiveWorkflow,
     wfactiveKey, DOWNSTREAM_REPOS,
-    EDIT_WINDOW_MS
+    EDIT_WINDOW_MS,
+    // exported for tests only — do not call from production code
+    _setInternalsForTest, handleTrackable, tryEdit, handleSingleNew,
+    buildConstructedConvRef,
+    attachPrContext, recordPrBranch, lookupPrByBranch,
+    prBranchKey, prNumberFromIssue, branchFromRef
 };
