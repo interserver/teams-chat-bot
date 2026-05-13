@@ -88,6 +88,48 @@ const DOWNSTREAM_REPOS = parseDownstreamMap(
     process.env.NOTIF_DOWNSTREAM_REPOS || 'detain/sugarcraft:sugarcraft/*'
 );
 
+// Parse a comma-separated list of repo patterns into a list of trimmed strings.
+// A pattern is either an exact "owner/repo" name or a wildcard "owner/*".
+function parseRepoPatterns(raw) {
+    return (raw || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+}
+
+// True when `repo` matches `pattern`. "owner/*" matches any "owner/anything"
+// (and bare "owner"). Anything else is an exact match.
+function repoMatchesPattern(repo, pattern) {
+    if (!repo || !pattern) return false;
+    if (pattern.endsWith('/*')) {
+        const prefix = pattern.slice(0, -2);
+        return repo === prefix || repo.startsWith(prefix + '/');
+    }
+    return repo === pattern;
+}
+
+// Decide whether a repo should be redirected to int-dev-announce. Returns:
+//   { redirect: true,  matched: [<announce patterns that matched>] }                          — redirect
+//   { redirect: false, excluded: true, matched: [...announce], excludedBy: [...exclude] }     — would have redirected, but excluded
+//   { redirect: false }                                                                       — no announce match
+//
+// The exclude list takes precedence over the announce list: a repo matching
+// both is NOT redirected. This lets the operator set a broad rule like
+// `detain/*` while carving out a handful of repos that should keep posting
+// to their default channel.
+function decideAnnounceRedirect(repo, announceRaw, excludeRaw) {
+    const announce = parseRepoPatterns(announceRaw);
+    const matched = announce.filter(p => repoMatchesPattern(repo, p));
+    if (matched.length === 0) return { redirect: false };
+
+    const exclude = parseRepoPatterns(excludeRaw);
+    const excludedBy = exclude.filter(p => repoMatchesPattern(repo, p));
+    if (excludedBy.length > 0) {
+        return { redirect: false, excluded: true, matched, excludedBy };
+    }
+    return { redirect: true, matched };
+}
+
 const WORKFLOW_EVENT_TYPES = new Set(['workflow_run', 'workflow_job', 'check_run', 'check_suite']);
 const BOT_PUSHER_RE = /^github-actions(\[bot\])?$/i;
 
@@ -1462,31 +1504,36 @@ async function runTick() {
             // to (and takes precedence over) the filter-based redirect.
             // Supports wildcard patterns like "detain/*" to match all repos under
             // an org, or exact repo names like "owner/repo".
-            const announceRepos = (process.env.NOTIF_ANNOUNCE_REPOS || '')
-                .split(',')
-                .map(s => s.trim())
-                .filter(Boolean);
+            //
+            // NOTIF_ANNOUNCE_REPOS_EXCLUDE is a whitelist of patterns that, when
+            // matched, exempt the repo from the announce redirect — useful when
+            // you want `detain/*` to go to int-dev-announce but keep a few
+            // specific detain repos posting to their default channel.
             const repo = it.env.extra?.repo || '';
-            const matchesAnnounce = announceRepos.some(pattern => {
-                if (pattern.endsWith('/*')) {
-                    // Wildcard pattern: matches "owner/repo" if pattern is "owner/*"
-                    const prefix = pattern.slice(0, -2);
-                    return repo.startsWith(prefix + '/') || repo === prefix;
-                }
-                return repo === pattern;
-            });
-            if (matchesAnnounce) {
+            const decision = decideAnnounceRedirect(
+                repo,
+                process.env.NOTIF_ANNOUNCE_REPOS,
+                process.env.NOTIF_ANNOUNCE_REPOS_EXCLUDE
+            );
+            if (decision.redirect) {
                 const originalRoom = it.env.room || 'unknown';
                 trace.emit('announce_redirect', {
                     from_room: originalRoom,
                     to_room: 'int-dev-announce',
                     repo: it.env.extra?.repo,
-                    matched_patterns: announceRepos
+                    matched_patterns: decision.matched
                 });
                 it.env.room = 'int-dev-announce';
                 if (!it.env.extra) it.env.extra = {};
                 it.env.extra.announce_redirect = true;
                 it.env.extra.original_room = originalRoom;
+            } else if (decision.excluded) {
+                trace.emit('announce_excluded', {
+                    room: it.env.room,
+                    repo: it.env.extra?.repo,
+                    matched_announce: decision.matched,
+                    matched_exclude: decision.excludedBy
+                });
             }
             // Auto-group GitHub events by commit SHA: inject a dedup_key so
             // the first event creates the trackable message and subsequent
@@ -2336,6 +2383,8 @@ module.exports = {
     parseDownstreamMap, isActionTriggeredPush, findParentSha, recordActiveWorkflow,
     wfactiveKey, DOWNSTREAM_REPOS,
     EDIT_WINDOW_MS,
+    // announce-redirect helpers (also used by tests)
+    parseRepoPatterns, repoMatchesPattern, decideAnnounceRedirect,
     // exported for tests only — do not call from production code
     _setInternalsForTest, handleTrackable, tryEdit, handleSingleNew,
     buildConstructedConvRef,
