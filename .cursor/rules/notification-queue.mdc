@@ -1,0 +1,21 @@
+---
+description: Notification queue rules for server/queue/**
+globs: server/queue/**
+alwaysApply: false
+---
+
+# Notification Queue Rules
+
+- Redis keys use prefix `process.env.NOTIF_KEY_PREFIX || 'notif:'`. Key helper: `k(name) => KEY_PREFIX + name`.
+- Queue: `notif:queue` (LPUSH/BRPOPLPUSH). In-flight: `notif:processing`. Failed: `notif:dead` (with `_dead_reason`, `_dead_at`).
+- Envelope JSON: `{ channel, text|attachments, extra?: { dedup_key, event_type, _commit_sha, data }, fallback_webhook_url? }`. `channel` MUST resolve via `CHANNELS`.
+- Trackable mode: envelopes with `extra.dedup_key` edit the most recent activity within `NOTIF_EDIT_WINDOW_MS` (30 min).
+- GitHub commit grouping: events with a commit SHA auto-get `dedup_key=github:commit:{sha7}`. Window: `NOTIF_COMMIT_GROUP_WINDOW_MS` (3 min).
+- PR-context: `attachPrContext` rewrites `dedup_key` to `github:pr:{repo}:{n}` for pushes/deletes/creates on a branch in `notif:prbranch:{repo}:{branch}` and for PR `issue_comment`.
+- Within a tick, items sharing a `dedup_key` MUST be folded via `handleTrackableBatch` (1 API call) — never iterated sequentially.
+- Filters (`server/queue/filters.js`): drop `star`/`watch`/`fork`/`ping`; drop successful `check_run`/`workflow_job`; drop `${{ matrix.* }}` placeholders.
+- Announce redirect: `NOTIF_ANNOUNCE_REPOS` → `int-dev-announce`; `NOTIF_ANNOUNCE_REPOS_EXCLUDE` exempts. Exclude wins.
+- Metrics counters: increment `notif:metrics:{enqueued|sent|edited|coalesced|redirected|fallback|dead}`.
+- Recovery on startup: move `notif:processing` items back to `notif:queue`.
+- Trace every decision via `trace.emit(kind, payload)` from `notifTrace.js`.
+- Test mock seam: `_setInternalsForTest({ redis, redisBot, adapter })`. Restore in `after()`.

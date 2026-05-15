@@ -1,0 +1,21 @@
+---
+description: Command module pattern for server/commands/**
+globs: server/commands/**
+alwaysApply: false
+---
+
+# Command Module Pattern
+
+- Export `{ match(text, lcText, deps), execute(matchResult, deps) }`.
+- `match` returns parsed data (truthy) or `null`. Never throw from `match`.
+- Admin-only: `if (deps.ima !== 'admin') return null;` FIRST line of `match`.
+- `deps` = `{ context, member, email, ima, db, redis, usersCollection, execFileAsync, bot }` — destructure only what you use.
+- Reply via `context.sendActivity(MessageFactory.text(...))` from `botbuilder`.
+- Card-submit handlers read `context.activity.value.msteams.type` (see `server/commands/ticketSubmit.js`).
+- Update edits: `context.updateActivity({ type: 'message', id: context.activity.value.activityId, conversation: context.activity.conversation, ... })`.
+- Register the module in the `commands` array in `server/commands/index.js`. Order matters — first match wins.
+- Add a `match()` test in `test/commands.test.js`.
+- HTTP via `axios`. Form posts: `new URLSearchParams(params)` + `Content-Type: application/x-www-form-urlencoded`.
+- DB via `deps.db.query(sql, params)` with `?`/`??` placeholders (mysql2 promise pool).
+- Redis via `deps.redis.get`/`set`/`sadd`/`srem`/`smembers`.
+- Multi-action commands use `{ action: '...', ...payload }` + `switch` in `execute` (see `githubIssues.js`).
