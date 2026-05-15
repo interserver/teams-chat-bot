@@ -12,6 +12,11 @@ module.exports = {
         const sentActivity = await context.sendActivity({
             attachments: [CardFactory.adaptiveCard(cardContents)]
         });
+        // Guard: sentActivity.id may be missing if sendActivity failed silently
+        if (!sentActivity || !sentActivity.id) {
+            console.warn('ticketCard: sentActivity.id missing, skipping updateActivity');
+            return;
+        }
         cardContents.body.forEach(element => bot.updateActionSubmitData(element, sentActivity));
         await context.updateActivity({
             type: 'message',

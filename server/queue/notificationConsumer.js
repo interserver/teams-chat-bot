@@ -963,6 +963,28 @@ function renderChecksGrouped(checkItems, level, lines, depth = 0) {
         const stripped = group.map(ci => ({ ...ci, segments: ci.segments.slice(1) }));
         const allLeaf = stripped.every(s => s.segments.length === 0);
 
+        const allSameStatus = stripped.every(s => s.statusKey === stripped[0].statusKey);
+
+        // Horizontal combine: when ALL items share same status AND same leaf,
+        // render as one line with comma-joined remaining segments + leaf.
+        // This is for cases like PHP 8.3 · candy-core + PHP 8.4 · candy-core
+        // which should combine to "PHP 8.3, PHP 8.4 · candy-core"
+        const first = stripped[0];
+        const allSameLeaf = stripped.every(s => s.leaf === first.leaf);
+
+        if (allSameStatus && allSameLeaf && !allLeaf) {
+            const versions = stripped.map(ci => ci.segments[0]).join(', ');
+            const leafPart = ` · **${ first.leaf }**`;
+            // Include a [d] link for each item (each version has its own URL)
+            const linkParts = stripped.map(ci => {
+                if (!ci.urlLink) return '';
+                return ci.urlLink.replace('[details]', '[d]').replace(/\s"[^"]*"\)\)$/, '))');
+            }).join(', ');
+            const linkPart = linkParts ? ' ' + linkParts : '';
+            lines.push(bulletPrefix(level) + `${ first.emoji } **${ seg }** **${ versions }** Check ${ first.statusText }${ leafPart }${ linkPart }`);
+            continue;
+        }
+
         if (!allLeaf) {
             // Deeper nesting still possible — peel and recurse.
             lines.push(bulletPrefix(level) + `**${ seg }**`);
@@ -970,16 +992,14 @@ function renderChecksGrouped(checkItems, level, lines, depth = 0) {
             continue;
         }
 
-        const allSameStatus = stripped.every(s => s.statusKey === stripped[0].statusKey);
+        // Same status, different leaves: emit shared header + individual leaves
         if (allSameStatus) {
-            const first = stripped[0];
             lines.push(bulletPrefix(level) + `${ first.emoji } **${ seg }** Check ${ first.statusText }`);
             emitLeafBucket(lines, level + 1, stripped);
             continue;
         }
 
-        // Mixed statuses at the leaf level: prefix-only header, then group by
-        // status (compress only when a status has 2+ items).
+        // Mixed statuses: group by status (compress only when a status has 2+ items).
         lines.push(bulletPrefix(level) + `**${ seg }**`);
         const byStatus = new Map();
         for (const s of stripped) {
@@ -1679,13 +1699,32 @@ async function processRoom(room, batch, stats) {
         trackable_keys: trackable.map(it => it.env.extra?.dedup_key)
     });
 
-    // 1. Trackable items: try to edit existing recent activity, else new send.
-    // Calls are awaited sequentially so when several events for the same
-    // dedup_key arrive in one batch, the first call's handleSingleNew saves
-    // to Redis before the next call's handleTrackable looks it up — no
-    // grouping work needs to happen here.
-    for (const it of trackable) {
-        await handleTrackable(room, it, stats);
+    // 1. Trackable items: sub-group by dedup_key and fold each group in
+    // memory so that N events for the same key produce ONE API call
+    // (1 edit if a recent activity is in the edit window, 1 send otherwise)
+    // instead of one API call per event. The merge function used
+    // (`mergeGithubTrackable`) is already idempotent in the way it folds
+    // events onto a header+items state, so repeated application is safe.
+    //
+    // Groups that don't qualify for batched merging (mixed `type`, mixed
+    // `_commit_sha`, or size 1) fall back to per-item processing.
+    const trackableGroups = groupTrackableByDedup(trackable);
+    for (const group of trackableGroups.values()) {
+        if (group.length === 1) {
+            await handleTrackable(room, group[0], stats);
+            continue;
+        }
+        if (canBatchMergeGroup(group)) {
+            await handleTrackableBatch(room, group, stats);
+        } else {
+            trace.emit('batch_skipped', {
+                room,
+                dedup_key: group[0].env.extra?.dedup_key,
+                group_size: group.length,
+                reason: 'heterogeneous_group'
+            });
+            for (const it of group) await handleTrackable(room, it, stats);
+        }
     }
 
     // 2. Coalescable items: combine within room.
@@ -1752,7 +1791,134 @@ async function handleTrackable(room, it, stats) {
     await handleSingleNew(room, it, stats);
 }
 
-async function tryEdit(room, it, recent, stats) {
+// Group trackable items by dedup_key, preserving arrival order within a group.
+// Returns a Map<dedup_key, item[]>.
+function groupTrackableByDedup(trackable) {
+    const groups = new Map();
+    for (const it of trackable) {
+        const key = it.env.extra?.dedup_key;
+        if (!key) continue;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(it);
+    }
+    return groups;
+}
+
+// A group qualifies for in-memory fold + single API call when:
+//  - every item is a msg (card edits replace wholesale, so batching them is
+//    no different from "last write wins"; falling back to per-item keeps
+//    each card's send_attempt trace event intact)
+//  - every item carries the same `_commit_sha` (so mergeGithubTrackable's
+//    github-append branch applies uniformly to the whole group)
+function canBatchMergeGroup(group) {
+    if (group.length < 2) return false;
+    if (!group.every(it => it.env.type === 'msg')) return false;
+    const shas = new Set(group.map(it => it.env.extra?._commit_sha || ''));
+    if (shas.size !== 1) return false;
+    // An empty SHA means a non-github trackable; mergeGithubTrackable can
+    // still handle those (it falls through to the bullet-append branch when
+    // there is no identity), so a group of same-key non-github events still
+    // batches.
+    return true;
+}
+
+// Fold a list of trackable envelopes for a single dedup_key into one API
+// call. Reduces N edits to 1 edit (or 1 send when no recent activity is
+// within the edit window).
+async function handleTrackableBatch(room, group, stats) {
+    const dedupKey = group[0].env.extra.dedup_key;
+    const commitSha = group[0].env.extra._commit_sha || null;
+
+    // Recent lookup — same precedence rules as handleTrackable: primary by
+    // dedup_key, fallback to commit-SHA-derived key.
+    let recent = null;
+    let recentSource = null;
+    try {
+        const raw = await redis.hget(recentKey(room), dedupKey);
+        if (raw) { recent = JSON.parse(raw); recentSource = 'dedup_key'; }
+    } catch (err) {
+        console.warn('[notif] batch hget failed:', err.message);
+    }
+    if (!recent && commitSha) {
+        try {
+            const shaBasedKey = `github:commit:${ commitSha }`;
+            const raw = await redis.hget(recentKey(room), shaBasedKey);
+            if (raw) { recent = JSON.parse(raw); recentSource = 'commit_sha_fallback'; }
+        } catch (err) {
+            console.warn('[notif] batch hget sha-fallback failed:', err.message);
+        }
+    }
+
+    const ageMs = recent ? Date.now() - recent.ts : null;
+    const inWindow = recent && recent.activityId && ageMs < EDIT_WINDOW_MS && recent.type === group[0].env.type;
+
+    // Fold every envelope in memory. Start from `recent` when in window so
+    // we extend the existing trackable; otherwise start from a fresh state
+    // and the merged result becomes the initial send.
+    let folded = inWindow
+        ? {
+            header: recent.header || recent.text || '',
+            items: Array.isArray(recent.items) ? recent.items.map(it => ({ ...it })) : [],
+            header_identity: recent.header_identity || null
+        }
+        : { header: '', items: [], header_identity: null };
+    let finalText = inWindow ? (recent.text || '') : '';
+
+    for (const it of group) {
+        const merged = mergeGithubTrackable(folded, it.env);
+        folded = {
+            header: merged.header,
+            items: merged.items,
+            header_identity: merged.header_identity
+        };
+        finalText = merged.text;
+    }
+
+    trace.emit('batch_merge', {
+        room,
+        dedup_key: dedupKey,
+        commit_sha: commitSha,
+        group_size: group.length,
+        had_recent: !!recent,
+        recent_source: recentSource,
+        in_window: !!inWindow,
+        final: { header: folded.header, items: folded.items, header_identity: folded.header_identity, text: finalText }
+    });
+
+    const last = group[group.length - 1];
+    const preMerged = {
+        text: finalText,
+        header: folded.header,
+        items: folded.items,
+        header_identity: folded.header_identity,
+        mergeMode: 'github_trackable_batch'
+    };
+
+    if (inWindow) {
+        const ok = await tryEdit(room, last, recent, stats, {
+            preMerged,
+            appendedDelta: group.length
+        });
+        if (ok) {
+            for (const it of group) await ackOne(it);
+            return;
+        }
+        // Edit failed — fall through to a fresh send with the merged content.
+        trace.emit('batch_edit_fell_through', { room, dedup_key: dedupKey, group_size: group.length });
+    }
+
+    await handleSingleNew(room, last, stats, {
+        preMergedText: finalText,
+        preMergedState: {
+            header: folded.header,
+            items: folded.items,
+            header_identity: folded.header_identity
+        },
+        groupItems: group
+    });
+}
+
+async function tryEdit(room, it, recent, stats, options = {}) {
     let conversationRef = await loadConvRef(recent.conversationId);
     let usedConstructed = false;
     if (!conversationRef) {
@@ -1780,7 +1946,16 @@ async function tryEdit(room, it, recent, stats) {
     let newItems = Array.isArray(recent.items) ? recent.items : null;
     let newHeaderIdentity = recent.header_identity || null;
     let mergeMode = null;
-    if (it.env.type === 'msg') {
+    if (options.preMerged) {
+        // Caller already folded N envelopes into `options.preMerged`. Trust
+        // that result and skip the inline merge — keeps the batch path from
+        // double-merging the last envelope on top of its own pre-merged state.
+        mergeMode = options.preMerged.mergeMode || 'github_trackable_batch';
+        newText = options.preMerged.text;
+        newHeader = options.preMerged.header;
+        newItems = options.preMerged.items;
+        newHeaderIdentity = options.preMerged.header_identity;
+    } else if (it.env.type === 'msg') {
         const recentSha = recent.commit_sha || null;
         const currentSha = it.env.extra && it.env.extra._commit_sha ? it.env.extra._commit_sha : null;
         const isGithubAppend = recentSha && currentSha && recentSha === currentSha;
@@ -1863,6 +2038,7 @@ async function tryEdit(room, it, recent, stats) {
         appended_count: (recent.appended_count || 0) + 1
     });
 
+    const appendedDelta = options.appendedDelta || 1;
     const updated = {
         activityId: recent.activityId,
         ts: Date.now(),
@@ -1871,7 +2047,7 @@ async function tryEdit(room, it, recent, stats) {
         header: newHeader,
         items: newItems,
         header_identity: newHeaderIdentity,
-        appended_count: (recent.appended_count || 0) + 1,
+        appended_count: (recent.appended_count || 0) + appendedDelta,
         conversationId: recent.conversationId,
         commit_sha: it.env.extra && it.env.extra._commit_sha ? it.env.extra._commit_sha : (recent.commit_sha || null)
     };
@@ -1905,10 +2081,15 @@ function initialTrackableState(env) {
     };
 }
 
-async function handleSingleNew(room, it, stats) {
+async function handleSingleNew(room, it, stats, options = {}) {
     const conversationId = resolveChannel(room) || resolveChannel('notifications');
+    // When the batch path supplies a pre-merged state, all envelopes in the
+    // group are msg-type and share a dedup_key; treat the merged text as the
+    // outgoing message body and persist the supplied state.
+    const sendText = options.preMergedText != null ? options.preMergedText : (it.env.message || '');
+    const groupItems = options.groupItems || [it];
     if (!conversationId) {
-        await fallbackSend(room, [it], stats, 'unknown_room');
+        await fallbackSend(room, groupItems, stats, 'unknown_room');
         return;
     }
     const conversationRef = await loadConvRef(conversationId);
@@ -1918,7 +2099,7 @@ async function handleSingleNew(room, it, stats) {
         const cards = Array.isArray(it.env.card) ? it.env.card : [it.env.card];
         activity = buildCardActivity(cards, null);
     } else {
-        activity = { type: 'message', text: it.env.message || '' };
+        activity = { type: 'message', text: sendText };
     }
 
     // If no stored convref, try constructed one before falling back to webhook
@@ -1926,12 +2107,12 @@ async function handleSingleNew(room, it, stats) {
         const constructedActivityId = await tryConstructedConvRef(room, conversationId, activity, stats);
         if (constructedActivityId) {
             if (constructedActivityId && it.env.extra && it.env.extra.dedup_key) {
-                const initial = initialTrackableState(it.env);
+                const initial = options.preMergedState || initialTrackableState(it.env);
                 await saveRecent(room, it.env.extra.dedup_key, {
                     activityId: constructedActivityId,
                     ts: Date.now(),
                     type: it.env.type,
-                    text: it.env.message,
+                    text: sendText,
                     ...initial,
                     appended_count: 0,
                     conversationId,
@@ -1940,22 +2121,24 @@ async function handleSingleNew(room, it, stats) {
             }
             stats.sent++;
             await bumpMetric('sent');
-            await ackOne(it);
+            for (const g of groupItems) await ackOne(g);
             return;
         }
         // Still no working convref - fall back to webhook
-        await fallbackSend(room, [it], stats, 'no_convref');
+        await fallbackSend(room, groupItems, stats, 'no_convref');
         return;
     }
 
-    const previewText = it.env.type === 'card' ? `[card ×${ Array.isArray(it.env.card) ? it.env.card.length : 1 }]` : preview(it.env.message);
-    console.log(`[notif] → send room=${ room } conv=${ shortConv(conversationId) } "${ previewText }"`);
+    const previewText = it.env.type === 'card' ? `[card ×${ Array.isArray(it.env.card) ? it.env.card.length : 1 }]` : preview(sendText);
+    const groupSuffix = groupItems.length > 1 ? ` (batched ×${ groupItems.length })` : '';
+    console.log(`[notif] → send room=${ room } conv=${ shortConv(conversationId) }${ groupSuffix } "${ previewText }"`);
     trace.emit('send_attempt', {
         room,
         conversation_id: conversationId,
         dedup_key: it.env.extra?.dedup_key,
         type: it.env.type,
-        text: it.env.type === 'msg' ? it.env.message : undefined
+        text: it.env.type === 'msg' ? sendText : undefined,
+        batched: groupItems.length > 1 ? groupItems.length : undefined
     });
     let activityId = null;
     try {
@@ -1972,7 +2155,7 @@ async function handleSingleNew(room, it, stats) {
     } catch (err) {
         console.warn(`[notif] send failed for ${ room }: ${ err.message }`);
         trace.emit('send_failed', { room, conversation_id: conversationId, error: err.message });
-        await fallbackSend(room, [it], stats, 'send_failed:' + err.message);
+        await fallbackSend(room, groupItems, stats, 'send_failed:' + err.message);
         return;
     }
     console.log(`[notif]   sent room=${ room } activity=${ activityId || '<none>' }`);
@@ -1984,12 +2167,12 @@ async function handleSingleNew(room, it, stats) {
     });
 
     if (activityId && it.env.extra && it.env.extra.dedup_key) {
-        const initial = initialTrackableState(it.env);
+        const initial = options.preMergedState || initialTrackableState(it.env);
         await saveRecent(room, it.env.extra.dedup_key, {
             activityId,
             ts: Date.now(),
             type: it.env.type,
-            text: it.env.message,
+            text: sendText,
             ...initial,
             appended_count: 0,
             conversationId,
@@ -1998,7 +2181,7 @@ async function handleSingleNew(room, it, stats) {
     }
     stats.sent++;
     await bumpMetric('sent');
-    await ackOne(it);
+    for (const g of groupItems) await ackOne(g);
 }
 
 async function handleCoalesced(room, items, stats) {
@@ -2385,6 +2568,8 @@ module.exports = {
     EDIT_WINDOW_MS,
     // announce-redirect helpers (also used by tests)
     parseRepoPatterns, repoMatchesPattern, decideAnnounceRedirect,
+    // batched-merge helpers (also used by tests)
+    groupTrackableByDedup, canBatchMergeGroup, handleTrackableBatch,
     // exported for tests only — do not call from production code
     _setInternalsForTest, handleTrackable, tryEdit, handleSingleNew,
     buildConstructedConvRef,

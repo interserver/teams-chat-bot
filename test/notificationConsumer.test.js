@@ -440,6 +440,52 @@ describe('mergeGithubTrackable — first-event becomes header', () => {
         assert.ok(r.text.split('\n').some(l => l.trim().startsWith('- **candy-vt**')), 'candy-vt rendered on its own bullet');
     });
 
+    it('horizontally combines 2 same-status, same-leaf items onto one line', () => {
+        // PHPStan PHP 8.3 · candy-core and PHPStan PHP 8.4 · candy-core both success
+        // → combined as "✅ PHP 8.3, PHP 8.4 · candy-core Check success ([d], [d])"
+        const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
+        // Note: "PHPStan PHP 8.X" splits to segments ["PHPStan","PHP 8.X"]
+        const r2 = mergeGithubTrackable(r1, checkRunEnv('PHPStan PHP 8.3 · candy-core', 'completed', 'success', '✅ **PHPStan PHP 8.3** Check success', 'https://example/cr/8.3'));
+        const r3 = mergeGithubTrackable(r2, checkRunEnv('PHPStan PHP 8.4 · candy-core', 'completed', 'success', '✅ **PHPStan PHP 8.4** Check success', 'https://example/cr/8.4'));
+
+        // Should be a single combined line with both versions and [d] links
+        const combinedLine = r3.text.split('\n').find(l => l.includes('**PHP 8.3, PHP 8.4**') && l.includes('· **candy-core**'));
+        assert.ok(combinedLine, 'combined line should contain both PHP versions and candy-core leaf');
+        assert.ok(combinedLine.includes('✅'), 'combined line should have success emoji');
+        assert.ok(combinedLine.includes('**PHP 8.3, PHP 8.4**'), 'both PHP versions should be comma-joined in bold');
+        assert.ok(combinedLine.includes('· **candy-core**'), 'leaf should appear after ·');
+        assert.ok(combinedLine.includes('Check success'), 'status text should be present');
+        assert.ok(combinedLine.includes('[d]('), '2-item combine should have [d] links');
+    });
+
+    it('horizontally combines 3+ same-status, same-leaf items with shortened link', () => {
+        // 3 PHPStan versions for candy-core all success
+        // → combined as "✅ PHP 8.3, PHP 8.4, PHP 8.5 · candy-core Check success ([d](url))"
+        let r = mergeGithubTrackable(emptyRecent(), pushEnv());
+        r = mergeGithubTrackable(r, checkRunEnv('PHPStan PHP 8.3 · candy-core', 'completed', 'success', '✅ **PHPStan PHP 8.3** Check success', 'https://example/cr/8.3'));
+        r = mergeGithubTrackable(r, checkRunEnv('PHPStan PHP 8.4 · candy-core', 'completed', 'success', '✅ **PHPStan PHP 8.4** Check success', 'https://example/cr/8.4'));
+        r = mergeGithubTrackable(r, checkRunEnv('PHPStan PHP 8.5 · candy-core', 'completed', 'success', '✅ **PHPStan PHP 8.5** Check success', 'https://example/cr/8.5'));
+
+        // Should be a single combined line with all versions and [d] link (3+ items)
+        const combinedLine = r.text.split('\n').find(l => l.includes('**PHP 8.3, PHP 8.4, PHP 8.5**'));
+        assert.ok(combinedLine, 'combined line should contain all PHP versions');
+        assert.ok(combinedLine.includes('Check success'), 'status text should be present');
+        assert.ok(combinedLine.includes('[d]('), '3+ item combine should use [d] link text, not [details]');
+        assert.ok(!combinedLine.includes('[details]'), '3+ item combine should not use full [details] text');
+    });
+
+    it('does not combine items with different leaves (different repos)', () => {
+        // PHPStan PHP 8.3 · candy-core success but PHPStan PHP 8.3 · sugar-prompt failure
+        // → should NOT combine horizontally since leaves differ
+        const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
+        const r2 = mergeGithubTrackable(r1, checkRunEnv('PHPStan PHP 8.3 · candy-core', 'completed', 'success', '✅ **PHPStan PHP 8.3** Check success', 'https://example/cr/core'));
+        const r3 = mergeGithubTrackable(r2, checkRunEnv('PHPStan PHP 8.3 · sugar-prompt', 'completed', 'failure', '❌ **PHPStan PHP 8.3** Check failure', 'https://example/cr/prompt'));
+
+        // Each should render on its own line since leaves differ
+        const lines = r3.text.split('\n').filter(l => l.includes('**candy-core**') || l.includes('**sugar-prompt**'));
+        assert.equal(lines.length, 2, 'different leaves should produce separate lines');
+    });
+
     it('sub-groups by status only when 2+ siblings share that status', () => {
         // 2 success + 1 queued under "render". The two successes share a
         // status row; the queued lone-wolf stays inline beside it.

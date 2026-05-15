@@ -16,6 +16,7 @@ const sendLimiter = rateLimit({
     max: parseInt(process.env.RATE_LIMIT_SEND_MAX || '30', 10),
     standardHeaders: true,
     legacyHeaders: false,
+    validateXForwardedForHeader: false,
     message: { error: 'Send limit exceeded, please slow down.' },
     keyGenerator: (req) => {
         const channel = req.body && req.body.channel ? `:${ req.body.channel }` : '';

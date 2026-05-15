@@ -16,14 +16,23 @@ module.exports = {
         return null;
     },
     async execute({ action }, { context, member, email }) {
+        // Guard: activityId is required for updateActivity but may be missing if card was
+        // sent before updateActionSubmitData injection or via fallback path.
+        const activityId = context.activity.value && context.activity.value.activityId;
+        const updateProps = {
+            type: 'message',
+            id: activityId,
+            conversation: context.activity.conversation
+        };
+        const canUpdate = Boolean(activityId);
+
         if (action === 'cancel') {
             console.log(context.activity.value);
-            await context.updateActivity({
-                type: 'message',
-                id: context.activity.value.activityId,
-                conversation: context.activity.conversation,
-                text: 'Add ticket canceled'
-            });
+            if (canUpdate) {
+                await context.updateActivity({ ...updateProps, text: 'Add ticket canceled' });
+            } else {
+                await context.sendActivity(MessageFactory.text('Add ticket canceled'));
+            }
             return;
         }
         // action === 'submit'
@@ -39,12 +48,11 @@ module.exports = {
                 new URLSearchParams(params),
                 { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
             if (response.status === 200) {
-                await context.updateActivity({
-                    type: 'message',
-                    id: context.activity.value.activityId,
-                    conversation: context.activity.conversation,
-                    text: response.data
-                });
+                if (canUpdate) {
+                    await context.updateActivity({ ...updateProps, text: response.data });
+                } else {
+                    await context.sendActivity(MessageFactory.text(response.data));
+                }
                 console.log('✅ Success:', response.data);
             } else {
                 await context.sendActivity(MessageFactory.text(response.data));

@@ -25,6 +25,7 @@ const apiLimiter = rateLimit({
     max: parseInt(process.env.RATE_LIMIT_MAX || '60', 10),                 // 60 req/min per IP
     standardHeaders: true,
     legacyHeaders: false,
+    validateXForwardedForHeader: false,  // Don't error when X-Forwarded-For is set but proxy isn't trusted
     message: { error: 'Too many requests, please try again later.' }
 });
 
@@ -34,6 +35,7 @@ const sendLimiter = rateLimit({
     max: parseInt(process.env.RATE_LIMIT_SEND_MAX || '30', 10),
     standardHeaders: true,
     legacyHeaders: false,
+    validateXForwardedForHeader: false,
     message: { error: 'Send limit exceeded, please slow down.' },
     keyGenerator: (req) => {
         // Rate limit by channel + IP so each channel gets its own quota
