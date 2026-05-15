@@ -597,7 +597,8 @@ function normalizeGithubDedup(it) {
     if (eventType === 'push' || eventType === 'workflow_job' ||
         eventType === 'check_run' || eventType === 'check_suite' ||
         eventType === 'workflow_run' || eventType === 'status' ||
-        eventType === 'commit_comment') {
+        eventType === 'commit_comment' || eventType === 'deployment' ||
+        eventType === 'deployment_status') {
         extra.dedup_key = `github:commit:${ sha }`;
         return;
     }

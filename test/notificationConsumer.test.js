@@ -81,6 +81,35 @@ function prReviewCommentEnv(commentId, message) {
     };
 }
 
+const DEPLOYMENT_MSG = 'ℹ️ detain triggered a deployment event (created) on detain/sugarcraft.';
+const DEPLOYMENT_STATUS_MSG = 'ℹ️ detain triggered a deployment_status event (created) on detain/sugarcraft.';
+
+function deploymentEnv(action = 'created', message = DEPLOYMENT_MSG) {
+    return {
+        type: 'msg',
+        message,
+        extra: {
+            event_type: 'deployment',
+            _commit_sha: 'ed74162',
+            dedup_key: 'github:commit:detain/sugarcraft:ed74162',
+            data: { deployment: { id: 123, sha: 'ed74162', action } }
+        }
+    };
+}
+
+function deploymentStatusEnv(state = 'success', message = DEPLOYMENT_STATUS_MSG) {
+    return {
+        type: 'msg',
+        message,
+        extra: {
+            event_type: 'deployment_status',
+            _commit_sha: 'ed74162',
+            dedup_key: 'github:commit:detain/sugarcraft:ed74162',
+            data: { deployment: { sha: 'ed74162' }, deployment_status: { state } }
+        }
+    };
+}
+
 describe('mergeGithubTrackable — first-event becomes header', () => {
     it('seeds the header from the first event when recent is empty', () => {
         const merged = mergeGithubTrackable(emptyRecent(), pushEnv());
@@ -606,5 +635,76 @@ describe('isActionTriggeredPush', () => {
         const env = pushEvent({ pusherName: 'github-actions[bot]' });
         env.extra.event_type = 'check_run';
         assert.equal(isActionTriggeredPush(env), false);
+    });
+});
+
+describe('mergeGithubTrackable — deployment events grouped by commit SHA', () => {
+    // These tests verify that deployment and deployment_status events
+    // (which carry a commit SHA) get grouped with push events for the same SHA.
+    // This requires PHP's buildDedupKey to emit github:commit:{repo}:{sha}
+    // for deployment events, and Node.js normalizeGithubDedup to preserve it.
+
+    it('groups deployment event with push event for same SHA', () => {
+        // Push event sets the header
+        const pushSha = 'ed74162';
+        const pushWithSha = {
+            type: 'msg',
+            message: `📦 Joe Huss pushed 1 commit to detain/sugarcraft master (compare)\n• ${pushSha} update (+46 ~1 -74 files)`,
+            extra: {
+                event_type: 'push',
+                _commit_sha: pushSha,
+                dedup_key: `github:commit:detain/sugarcraft:${pushSha}`
+            }
+        };
+        const r1 = mergeGithubTrackable(emptyRecent(), pushWithSha);
+        assert.equal(r1.header, '📦 Joe Huss pushed 1 commit to detain/sugarcraft master (compare)');
+
+        // Deployment event for same SHA merges into same trackable
+        const depWithSha = {
+            type: 'msg',
+            message: 'ℹ️ detain triggered a deployment event (created) on detain/sugarcraft.',
+            extra: {
+                event_type: 'deployment',
+                _commit_sha: pushSha,
+                dedup_key: `github:commit:detain/sugarcraft:${pushSha}`,
+                data: { deployment: { id: 123, sha: pushSha, action: 'created' } }
+            }
+        };
+        const r2 = mergeGithubTrackable(r1, depWithSha);
+        // Header should remain the push event
+        assert.equal(r2.header, '📦 Joe Huss pushed 1 commit to detain/sugarcraft master (compare)');
+        // The deployment event should be appended as a bullet
+        assert.ok(r2.text.includes('deployment'), 'deployment event should be in merged text');
+    });
+
+    it('groups multiple deployment_status events with same SHA', () => {
+        const sha = 'ed74162';
+        const dep1 = {
+            type: 'msg',
+            message: 'ℹ️ detain triggered a deployment_status event (in_progress) on detain/sugarcraft.',
+            extra: {
+                event_type: 'deployment_status',
+                _commit_sha: sha,
+                dedup_key: `github:commit:detain/sugarcraft:${sha}`,
+                data: { deployment: { sha }, deployment_status: { state: 'in_progress' } }
+            }
+        };
+        const r1 = mergeGithubTrackable(emptyRecent(), dep1);
+
+        const dep2 = {
+            type: 'msg',
+            message: 'ℹ️ detain triggered a deployment_status event (success) on detain/sugarcraft.',
+            extra: {
+                event_type: 'deployment_status',
+                _commit_sha: sha,
+                dedup_key: `github:commit:detain/sugarcraft:${sha}`,
+                data: { deployment: { sha }, deployment_status: { state: 'success' } }
+            }
+        };
+        const r2 = mergeGithubTrackable(r1, dep2);
+
+        // Both deployment_status events should be in the same trackable
+        assert.ok(r2.text.includes('in_progress'), 'first status should be present');
+        assert.ok(r2.text.includes('success'), 'second status should be present');
     });
 });
