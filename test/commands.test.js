@@ -10,6 +10,7 @@ const setMaster = require('../server/commands/setMaster');
 const ticketCard = require('../server/commands/ticketCard');
 const ticketSubmit = require('../server/commands/ticketSubmit');
 const ticketQuick = require('../server/commands/ticketQuick');
+const ticketPost = require('../server/commands/ticketPost');
 const mailbabyUser = require('../server/commands/mailbabyUser');
 const ipLookup = require('../server/commands/ipLookup');
 const blockEmail = require('../server/commands/blockEmail');
@@ -139,6 +140,78 @@ describe('ticketQuick command', () => {
         const m = ticketQuick.match('add foo ticket bar', 'add foo ticket bar', { ima: 'admin' });
         assert.ok(m);
         assert.equal(m.invalidDept, 'foo');
+    });
+});
+
+// ─── ticketPost ─────────────────────────────────────────────────────────────
+
+describe('ticketPost command', () => {
+    it('matches "add ticket #EBC-923-68152 post hello world"', () => {
+        const text = 'add ticket #EBC-923-68152 post hello world';
+        const m = ticketPost.match(text, text.toLowerCase(), { ima: 'admin' });
+        assert.ok(m);
+        assert.equal(m.ticketId, 'EBC-923-68152');
+        assert.equal(m.body, 'hello world');
+    });
+    it('matches without leading #', () => {
+        const text = 'add ticket EBC-923-68152 post some reply';
+        const m = ticketPost.match(text, text.toLowerCase(), { ima: 'admin' });
+        assert.ok(m);
+        assert.equal(m.ticketId, 'EBC-923-68152');
+        assert.equal(m.body, 'some reply');
+    });
+    it('matches multi-line body', () => {
+        const text = 'add ticket #ABC-1-2 post line one\nline two';
+        const m = ticketPost.match(text, text.toLowerCase(), { ima: 'admin' });
+        assert.ok(m);
+        assert.equal(m.ticketId, 'ABC-1-2');
+        assert.equal(m.body, 'line one\nline two');
+    });
+    it('does not match for non-admin', () => {
+        const text = 'add ticket #ABC-1-2 post hi';
+        assert.equal(ticketPost.match(text, text.toLowerCase(), { ima: 'user' }), null);
+    });
+    it('does not match without post keyword', () => {
+        const text = 'add ticket #ABC-1-2 hi there';
+        assert.equal(ticketPost.match(text, text.toLowerCase(), { ima: 'admin' }), null);
+    });
+    it('matches "reply" as an alias for "post"', () => {
+        const text = 'add ticket #EBC-923-68152 reply hello world';
+        const m = ticketPost.match(text, text.toLowerCase(), { ima: 'admin' });
+        assert.ok(m);
+        assert.equal(m.ticketId, 'EBC-923-68152');
+        assert.equal(m.body, 'hello world');
+    });
+    it('matches integer ticket id with reply alias', () => {
+        const text = 'add ticket 12345 reply fixed';
+        const m = ticketPost.match(text, text.toLowerCase(), { ima: 'admin' });
+        assert.ok(m);
+        assert.equal(m.ticketId, '12345');
+        assert.equal(m.body, 'fixed');
+    });
+    it('matches multi-line body with reply alias', () => {
+        const text = 'add ticket #ABC-1-2 reply line one\nline two';
+        const m = ticketPost.match(text, text.toLowerCase(), { ima: 'admin' });
+        assert.ok(m);
+        assert.equal(m.ticketId, 'ABC-1-2');
+        assert.equal(m.body, 'line one\nline two');
+    });
+    it('matches integer ticket id', () => {
+        const text = 'add ticket 12345 post fixed';
+        const m = ticketPost.match(text, text.toLowerCase(), { ima: 'admin' });
+        assert.ok(m);
+        assert.equal(m.ticketId, '12345');
+        assert.equal(m.body, 'fixed');
+    });
+    it('matches integer ticket id with leading #', () => {
+        const text = 'add ticket #98765 post done';
+        const m = ticketPost.match(text, text.toLowerCase(), { ima: 'admin' });
+        assert.ok(m);
+        assert.equal(m.ticketId, '98765');
+    });
+    it('does not match malformed id (no dashes, non-numeric)', () => {
+        const text = 'add ticket foo post bar';
+        assert.equal(ticketPost.match(text, text.toLowerCase(), { ima: 'admin' }), null);
     });
 });
 

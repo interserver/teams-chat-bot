@@ -20,6 +20,7 @@ const ADMIN_COMMANDS = {
     'search asset <hostname/id>': 'Look up an asset by hostname or ID',
     '**Tickets**': null,
     'add <department> ticket <subject>': 'Create a support ticket (bugs, hardware, billing, etc.)',
+    'add ticket #<id> post|reply <content>': 'Add a reply/post to an existing ticket',
     '**MailBaby**': null,
     'add mailbaby user <user> <pass>': 'Add a MailBaby SMTP user',
     'delete mailbaby user <user>': 'Delete a MailBaby SMTP user',

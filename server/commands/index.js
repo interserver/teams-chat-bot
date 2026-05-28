@@ -9,6 +9,7 @@ const commands = [
     require('./setMaster'),
     require('./ticketCard'),
     require('./ticketSubmit'),
+    require('./ticketPost'),
     require('./ticketQuick'),
     require('./mailbabyUser'),
     require('./ipLookup'),

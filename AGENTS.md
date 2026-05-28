@@ -23,7 +23,7 @@ devtunnel host -p 3978 --allow-anonymous
 - **Entry**: `server/index.js` — `dotenv` loads `../.env`, `validateEnv()` runs, mounts `/api` with `apiLimiter` (60/min/IP), exposes `/health` + `/health/queue`, starts `notificationConsumer` and optional `syncConversationReferences()`
 - **Routes** (`server/api/index.js`): `POST /api/messages` → `botController.js` · `POST /api/message` → `msgController.js` (sendLimiter) · `POST /api/dailyrecap` → `dailyRecapController.js`
 - **Bot** (`server/bot/`): `botActivityHandler.js` extends `TeamsActivityHandler` — owns MySQL pool, Mongo `usersCollection`, Redis client, `onMessage` → `dispatch()`, `setMaster()`, `probeChannel()`, `syncConversationReferences()`. `dialogBot.js` · `teamsBot.js` host the OAuth waterfall
-- **Commands** (`server/commands/`): 21 modules — each exports `{ match(text, lcText, deps), execute(matchResult, deps) }`. Dispatched in order by `index.js` → first match wins. Admin gate: `if (ima !== 'admin') return null;`. See `ima.js`, `ping.js`, `githubIssues.js`, `notifAdmin.js`, `dailyRecap.js`, `ticketCard.js`/`ticketSubmit.js`/`ticketQuick.js`
+- **Commands** (`server/commands/`): 22 modules — each exports `{ match(text, lcText, deps), execute(matchResult, deps) }`. Dispatched in order by `index.js` → first match wins. Admin gate: `if (ima !== 'admin') return null;`. See `ima.js`, `ping.js`, `githubIssues.js`, `notifAdmin.js`, `dailyRecap.js`, `ticketCard.js`/`ticketSubmit.js`/`ticketPost.js`/`ticketQuick.js`
 - **Queue** (`server/queue/`): `notificationConsumer.js` polls `notif:queue` → trackable / coalesced / single sends, dead-letters to `notif:dead`. `channels.js` exports `CHANNELS` + `resolve(roomName)`. `filters.js` drops low-signal GitHub events (`star`, `watch`, `fork`, `ping`, successful `check_run`/`workflow_job`)
 - **Shared libs** (`server/lib/`): `adapter.js` (`getAdapter()` singleton) · `redis.js` (`createBotRedis()`, `createNotifRedis()`, `TEAMS_SERVICE_URL`) · `retry.js` (`runWithRetry(fn, opts)` exponential backoff + jitter, classifies transient/auth/rate-limit)
 - **Dialogs** (`server/dialogs/`): `mainDialog.js` (OAuth waterfall: `promptStep` → `loginStep` → `displayTokenPhase1` → `displayTokenPhase2`) extends `logoutDialog.js` extends `ComponentDialog`
@@ -35,7 +35,7 @@ devtunnel host -p 3978 --allow-anonymous
 
 Required (`server/validateEnv.js`): `MicrosoftAppId`, `MicrosoftAppPassword`, `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASS`, `MYSQL_DB`, `ZONEMTA_USERNAME`, `ZONEMTA_PASSWORD`, `ZONEMTA_HOST`.
 
-Optional: `PORT` (3978), `connectionName`, `TEAMS_SERVICE_URL`, `REDIS_USER`/`REDIS_PASSWORD`, `REDIS_HOST_MY`/`REDIS_PORT_MY`, `DAILY_RECAP_URL`/`DAILY_RECAP_TOKEN`, `GITHUB_OWNER`/`GITHUB_REPO`, `TICKET_API_URL`, `BOT_AAD_OBJECT_ID`/`BOT_TENANT_ID`, `CHANNEL_SYNC_ENABLED`, `NOTIF_*`, `RATE_LIMIT_*`. Full table in `Readme.md` v2 changelog.
+Optional: `PORT` (3978), `connectionName`, `TEAMS_SERVICE_URL`, `REDIS_USER`/`REDIS_PASSWORD`, `REDIS_HOST_MY`/`REDIS_PORT_MY`, `DAILY_RECAP_URL`/`DAILY_RECAP_TOKEN`, `GITHUB_OWNER`/`GITHUB_REPO`, `TICKET_API_URL`/`TICKET_POST_API_URL`, `BOT_AAD_OBJECT_ID`/`BOT_TENANT_ID`, `CHANNEL_SYNC_ENABLED`, `NOTIF_*`, `RATE_LIMIT_*`. Full table in `Readme.md` v2 changelog.
 
 ## Key Patterns
 
@@ -86,3 +86,20 @@ Run `caliber refresh` to keep docs in sync, then stage updated docs.
 Read `CALIBER_LEARNINGS.md` for patterns and anti-patterns learned from previous sessions.
 These are auto-extracted from real tool usage — treat them as project-specific rules.
 <!-- /caliber:managed:learnings -->
+
+<!-- caliber:managed:model-config -->
+## Model Configuration
+
+Recommended default: `claude-sonnet-4-6` with high effort (stronger reasoning; higher cost and latency than smaller models).
+Smaller/faster models trade quality for speed and cost — pick what fits the task.
+Pin your choice (`/model` in Claude Code, or `CALIBER_MODEL` when using Caliber with an API provider) so upstream default changes do not silently change behavior.
+
+<!-- /caliber:managed:model-config -->
+
+<!-- caliber:managed:sync -->
+## Context Sync
+
+This project uses [Caliber](https://github.com/caliber-ai-org/ai-setup) to keep AI agent configs in sync across Claude Code, Cursor, Copilot, and Codex.
+Configs update automatically before each commit via `caliber refresh`.
+If the pre-commit hook is not set up, read `.agents/skills/setup-caliber/SKILL.md` and follow the setup instructions.
+<!-- /caliber:managed:sync -->
