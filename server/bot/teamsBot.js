@@ -37,9 +37,9 @@ class TeamsBot extends DialogBot {
     /**
      * Receives invoke activities with Activity name of 'signin/verifyState'.
      * @param {TurnContext} context - The context object for the turn.
-     * @param {Object} state - The state object.
+     * @param {Object} _state - The state object (unused).
      */
-    async handleTeamsSigninVerifyState(context, state) {
+    async handleTeamsSigninVerifyState(context, _state) {
         console.log('Running dialog with signin/verifyState from an Invoke Activity.');
         await this.dialog.run(context, this.dialogState);
     }
@@ -47,9 +47,9 @@ class TeamsBot extends DialogBot {
     /**
      * Receives invoke activities with Activity name of 'signin/tokenExchange'.
      * @param {TurnContext} context - The context object for the turn.
-     * @param {Object} state - The state object.
+     * @param {Object} _state - The state object (unused).
      */
-    async handleTeamsSigninTokenExchange(context, state) {
+    async handleTeamsSigninTokenExchange(context, _state) {
         console.log('Running dialog with signin/tokenExchange from an Invoke Activity.');
         await this.dialog.run(context, this.dialogState);
     }

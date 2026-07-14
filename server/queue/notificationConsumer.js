@@ -12,7 +12,7 @@
 
 const axios = require('axios');
 
-const { runWithRetry, classify } = require('../lib/retry');
+const { runWithRetry } = require('../lib/retry');
 const { resolve: resolveChannel } = require('./channels');
 const { shouldSkip } = require('./filters');
 const { getAdapter } = require('../lib/adapter');
@@ -29,9 +29,6 @@ const KEY_PREFIX = process.env.NOTIF_KEY_PREFIX || 'notif:';
 const HEARTBEAT_MS = parseInt(process.env.NOTIF_HEARTBEAT_MS || '60000', 10);
 const APPEND_BREAK = '\n\n— · —\n\n';
 const APPEND_TRAIL_SUMMARY_AFTER = 3;
-// GitHub commit grouping window — if no event for a given commit SHA arrives
-// within this many ms of the last edit, a new message is started.
-const COMMIT_GROUP_WINDOW_MS = parseInt(process.env.NOTIF_COMMIT_GROUP_WINDOW_MS || '180000', 10); // 3 min
 
 function k(name) { return KEY_PREFIX + name; }
 function recentKey(room) { return k('recent:') + room; }
@@ -451,88 +448,6 @@ function extractCommitSha(env) {
 }
 
 // ---------------------------------------------------------------------------
-// GitHub job status line builder
-// ---------------------------------------------------------------------------
-
-/**
- * Build a single status line for a GitHub job event (check_run / workflow_job).
- * Format: {emoji} {job_name} {status_or_conclusion}
- * Returns null if this envelope doesn't represent a runnable job.
- */
-function buildGithubJobLine(env) {
-    const extra = env.extra || {};
-    const data = extra.data || {};
-    const eventType = extra.event_type || '';
-
-    let name = '';
-    let conclusion = '';
-    let status = '';
-    let htmlUrl = '';
-
-    if (eventType === 'check_run') {
-        const cr = data.check_run || {};
-        name = cr.name || 'check_run';
-        conclusion = cr.conclusion || '';
-        status = cr.status || '';
-        htmlUrl = cr.html_url || '';
-    } else if (eventType === 'workflow_job') {
-        const wj = data.workflow_job || {};
-        name = wj.name || wj.workflow_name || 'workflow_job';
-        conclusion = wj.conclusion || '';
-        status = wj.status || '';
-        htmlUrl = wj.html_url || '';
-    } else {
-        return null;
-    }
-
-    // Determine emoji and status text
-    let emoji = '';
-    let statusText = '';
-
-    if (conclusion) {
-        // Has conclusion - job completed
-        switch (conclusion) {
-        case 'success': emoji = '✅'; break;
-        case 'failure': emoji = '❌'; break;
-        case 'skipped': emoji = '⏭️'; break;
-        case 'cancelled': emoji = '⚠️'; break;
-        case 'neutral': emoji = 'ℹ️'; break;
-        default: emoji = '❓';
-        }
-        statusText = conclusion;
-    } else if (status) {
-        // No conclusion yet - in progress
-        switch (status) {
-        case 'queued': emoji = '⏳'; statusText = 'queued'; break;
-        case 'in_progress': emoji = '🔄'; statusText = 'in_progress'; break;
-        case 'waiting': emoji = '⏸️'; statusText = 'waiting'; break;
-        default: emoji = '❓'; statusText = status;
-        }
-    } else {
-        return null; // Can't build line without status or conclusion
-    }
-
-    let line = `${ emoji } ${ name }`;
-    if (statusText) line += ` ${ statusText }`;
-    if (htmlUrl) line += ` (${ htmlUrl })`;
-
-    return line;
-}
-
-/** Return a human-readable duration string from an ISO timestamp, or null. */
-function elapsedMs(isoTimestamp) {
-    if (!isoTimestamp) return null;
-    const diff = Date.now() - new Date(isoTimestamp).getTime();
-    if (isNaN(diff) || diff < 0) return null;
-    const s = Math.floor(diff / 1000);
-    if (s < 60) return `${ s }s`;
-    const m = Math.floor(s / 60);
-    const h = Math.floor(m / 60);
-    if (h > 0) return `${ h }h ${ m % 60 }m`;
-    return `${ m }m ${ s % 60 }s`;
-}
-
-// ---------------------------------------------------------------------------
 // GitHub dedup normalisation
 // ---------------------------------------------------------------------------
 
@@ -711,9 +626,8 @@ function prIdentity(env) {
 
 /**
  * Pick the emoji + status-text for a check_run / workflow_job conclusion or
- * in-flight status. Mirrors the table in `buildGithubJobLine` so verbose
- * (env.message) and condensed (condensedBulletText) renderings stay
- * consistent.
+ * in-flight status. Keeps verbose (env.message) and condensed
+ * (condensedBulletText) renderings consistent.
  */
 function pickStatusEmoji(conclusion, status) {
     if (conclusion) {
@@ -814,7 +728,7 @@ function indentAsBullet(messageText) {
     const out = [];
     let firstHandled = false;
     for (const line of lines) {
-        const m = line.match(/^[•*\-]\s+(.+)/);
+        const m = line.match(/^[•*-]\s+(.+)/);
         if (m) {
             out.push(bulletPrefix(2) + m[1]);
         } else if (!firstHandled) {
@@ -1149,7 +1063,7 @@ function splitHeaderAndBullets(text) {
     for (const raw of lines) {
         const trimmed = raw.trim();
         if (!trimmed) continue; // collapse blank lines
-        const m = trimmed.match(/^[•*\-]\s+(.+)/);
+        const m = trimmed.match(/^[•*-]\s+(.+)/);
         if (m) {
             bulletsStarted = true;
             bulletItems.push({ identity: null, text: m[1] });
@@ -1207,7 +1121,7 @@ function parentAlreadyShowsPrBody(env, header, items) {
     const stored = [header, ...items.map(it => (it && it.text) || '')].join('\n');
     const norm = s => String(s)
         .split('\n')
-        .map(l => l.replace(/^[ \t]*[•*\-][ \t]+/, '').trim())
+        .map(l => l.replace(/^[ \t]*[•*-][ \t]+/, '').trim())
         .filter(l => l)
         .join(' ');
     return norm(stored).includes(norm(body));
@@ -1424,7 +1338,7 @@ async function runTick() {
     tickInFlight = true;
     const t0 = Date.now();
     totalTicks++;
-    const tickNum = trace.newTick();
+    trace.newTick();
     const stats = { drained: 0, sent: 0, edited: 0, coalesced: 0, fallback: 0, dead: 0, expired: 0, redirected: 0 };
     try {
         // Recover anything left over from a prior crashed tick BEFORE we drain new items.
@@ -1946,7 +1860,7 @@ async function tryEdit(room, it, recent, stats, options = {}) {
     let newHeader = recent.header || null;
     let newItems = Array.isArray(recent.items) ? recent.items : null;
     let newHeaderIdentity = recent.header_identity || null;
-    let mergeMode = null;
+    let mergeMode;
     if (options.preMerged) {
         // Caller already folded N envelopes into `options.preMerged`. Trust
         // that result and skip the inline merge — keeps the batch path from
@@ -2461,7 +2375,7 @@ function buildConstructedConvRef(room, conversationId) {
 // This is a fallback when loadConvRef returns null (e.g., bot was installed
 // before onInstallationUpdateAdd started capturing convrefs).
 // Returns the new activity id on success, null on failure.
-async function tryConstructedConvRef(room, conversationId, activity, stats) {
+async function tryConstructedConvRef(room, conversationId, activity, _stats) {
     const constructedRef = buildConstructedConvRef(room, conversationId);
     console.log(`[notif] → trying constructed convref room=${ room } conv=${ shortConv(conversationId) } serviceUrl=${ TEAMS_SERVICE_URL }`);
     trace.emit('constructed_convref_attempt', { room, conversation_id: conversationId, op: 'send' });

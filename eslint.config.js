@@ -21,10 +21,14 @@ module.exports = [
                 'asyncArrow': 'always'
             }],
             'template-curly-spacing': [2, 'always'],
-            'no-unused-vars': [1, { 'argsIgnorePattern': '^_' }]
+            'no-unused-vars': [1, {
+                'argsIgnorePattern': '^_',
+                'varsIgnorePattern': '^_',
+                'caughtErrorsIgnorePattern': '^_'
+            }]
         }
     },
     {
-        ignores: ['node_modules/**']
+        ignores: ['node_modules/**', 'dist/**', 'build/**', 'coverage/**', '.logs/**']
     }
 ];

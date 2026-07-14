@@ -5,7 +5,7 @@ esbuild.build({
     platform: 'node',
     outfile: 'dist/index.js'
 })
-    .then((r) => {
+    .then(() => {
         console.log('Build succeeded.');
     })
     .catch((e) => {

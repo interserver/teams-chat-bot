@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 const express = require('express');
-const rateLimit = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 
 const router = express.Router();
 
@@ -13,14 +13,14 @@ router.use(express.urlencoded({ extended: true })); // for application/x-www-for
 // Stricter rate limit for proactive-send endpoints
 const sendLimiter = rateLimit({
     windowMs: parseInt(process.env.RATE_LIMIT_SEND_WINDOW_MS || '60000', 10),
-    max: parseInt(process.env.RATE_LIMIT_SEND_MAX || '30', 10),
+    limit: parseInt(process.env.RATE_LIMIT_SEND_MAX || '30', 10),
     standardHeaders: true,
     legacyHeaders: false,
-    validateXForwardedForHeader: false,
+    validate: { xForwardedForHeader: false },
     message: { error: 'Send limit exceeded, please slow down.' },
     keyGenerator: (req) => {
         const channel = req.body && req.body.channel ? `:${ req.body.channel }` : '';
-        return `${ req.ip }${ channel }`;
+        return `${ ipKeyGenerator(req.ip) }${ channel }`;
     }
 });
 

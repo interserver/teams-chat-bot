@@ -14,8 +14,6 @@ const REPO_OPT_OUT = new Set([
 ]);
 
 const LOW_SIGNAL_GITHUB_EVENTS = new Set(['star', 'watch', 'fork', 'ping']);
-const SUCCESSFUL_CHECK_CONCLUSIONS = new Set(['success', 'neutral', 'skipped', 'cancelled']);
-const SUCCESSFUL_WORKFLOW_CONCLUSIONS = new Set(['success', 'skipped', 'cancelled']);
 
 function shouldSkip(envelope) {
     const extra = envelope.extra || {};

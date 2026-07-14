@@ -1,7 +1,7 @@
 const { MessageFactory } = require('botbuilder');
 
 module.exports = {
-    match(text, lcText) {
+    match(text, _lcText) {
         const m = text.match(/^ping\s+(.+)$/i);
         return m ? { target: m[1].trim() } : null;
     },

@@ -81,35 +81,6 @@ function prReviewCommentEnv(commentId, message) {
     };
 }
 
-const DEPLOYMENT_MSG = 'ℹ️ detain triggered a deployment event (created) on detain/sugarcraft.';
-const DEPLOYMENT_STATUS_MSG = 'ℹ️ detain triggered a deployment_status event (created) on detain/sugarcraft.';
-
-function deploymentEnv(action = 'created', message = DEPLOYMENT_MSG) {
-    return {
-        type: 'msg',
-        message,
-        extra: {
-            event_type: 'deployment',
-            _commit_sha: 'ed74162',
-            dedup_key: 'github:commit:detain/sugarcraft:ed74162',
-            data: { deployment: { id: 123, sha: 'ed74162', action } }
-        }
-    };
-}
-
-function deploymentStatusEnv(state = 'success', message = DEPLOYMENT_STATUS_MSG) {
-    return {
-        type: 'msg',
-        message,
-        extra: {
-            event_type: 'deployment_status',
-            _commit_sha: 'ed74162',
-            dedup_key: 'github:commit:detain/sugarcraft:ed74162',
-            data: { deployment: { sha: 'ed74162' }, deployment_status: { state } }
-        }
-    };
-}
-
 describe('mergeGithubTrackable — first-event becomes header', () => {
     it('seeds the header from the first event when recent is empty', () => {
         const merged = mergeGithubTrackable(emptyRecent(), pushEnv());
@@ -649,11 +620,11 @@ describe('mergeGithubTrackable — deployment events grouped by commit SHA', () 
         const pushSha = 'ed74162';
         const pushWithSha = {
             type: 'msg',
-            message: `📦 Joe Huss pushed 1 commit to detain/sugarcraft master (compare)\n• ${pushSha} update (+46 ~1 -74 files)`,
+            message: `📦 Joe Huss pushed 1 commit to detain/sugarcraft master (compare)\n• ${ pushSha } update (+46 ~1 -74 files)`,
             extra: {
                 event_type: 'push',
                 _commit_sha: pushSha,
-                dedup_key: `github:commit:detain/sugarcraft:${pushSha}`
+                dedup_key: `github:commit:detain/sugarcraft:${ pushSha }`
             }
         };
         const r1 = mergeGithubTrackable(emptyRecent(), pushWithSha);
@@ -666,7 +637,7 @@ describe('mergeGithubTrackable — deployment events grouped by commit SHA', () 
             extra: {
                 event_type: 'deployment',
                 _commit_sha: pushSha,
-                dedup_key: `github:commit:detain/sugarcraft:${pushSha}`,
+                dedup_key: `github:commit:detain/sugarcraft:${ pushSha }`,
                 data: { deployment: { id: 123, sha: pushSha, action: 'created' } }
             }
         };
@@ -685,7 +656,7 @@ describe('mergeGithubTrackable — deployment events grouped by commit SHA', () 
             extra: {
                 event_type: 'deployment_status',
                 _commit_sha: sha,
-                dedup_key: `github:commit:detain/sugarcraft:${sha}`,
+                dedup_key: `github:commit:detain/sugarcraft:${ sha }`,
                 data: { deployment: { sha }, deployment_status: { state: 'in_progress' } }
             }
         };
@@ -697,7 +668,7 @@ describe('mergeGithubTrackable — deployment events grouped by commit SHA', () 
             extra: {
                 event_type: 'deployment_status',
                 _commit_sha: sha,
-                dedup_key: `github:commit:detain/sugarcraft:${sha}`,
+                dedup_key: `github:commit:detain/sugarcraft:${ sha }`,
                 data: { deployment: { sha }, deployment_status: { state: 'success' } }
             }
         };

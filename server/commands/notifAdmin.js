@@ -36,22 +36,22 @@ module.exports = {
         }
         try {
             switch (sub) {
-                case 'status':
-                    return await statusCmd(context, notifRedis);
-                case 'rooms':
-                    return await roomsCmd(context, botRedis);
-                case 'test':
-                    return await testCmd(context, notifRedis, rest);
-                case 'drain-dead':
-                    return await drainDeadCmd(context, notifRedis);
-                case 'seed-room':
-                    return await seedRoomCmd(context, botRedis, rest);
-                case 'wfactive':
-                    return await wfactiveCmd(context, notifRedis);
-                case '':
-                case 'help':
-                default:
-                    return await helpCmd(context);
+            case 'status':
+                return await statusCmd(context, notifRedis);
+            case 'rooms':
+                return await roomsCmd(context, botRedis);
+            case 'test':
+                return await testCmd(context, notifRedis, rest);
+            case 'drain-dead':
+                return await drainDeadCmd(context, notifRedis);
+            case 'seed-room':
+                return await seedRoomCmd(context, botRedis, rest);
+            case 'wfactive':
+                return await wfactiveCmd(context, notifRedis);
+            case '':
+            case 'help':
+            default:
+                return await helpCmd(context);
             }
         } catch (err) {
             await context.sendActivity(MessageFactory.text(`!notif ${ sub } failed: ${ err.message }`));

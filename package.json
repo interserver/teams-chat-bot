@@ -18,32 +18,36 @@
   "author": "Microsoft",
   "license": "MIT",
   "dependencies": {
-    "@microsoft/microsoft-graph-client": "~2.0.0",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
     "@octokit/rest": "^22.0.1",
     "adaptive-expressions": "^4.23.3",
     "adaptivecards-templating": "^2.3.1",
     "axios": "^1.7.0",
-    "body-parser": "^1.19.0",
-    "botbuilder": "^4.23.2",
-    "botbuilder-dialogs": "^4.23.2",
-    "botframework-connector": "^4.23.2",
-    "botframework-schema": "^4.23.2",
+    "body-parser": "^2.3.0",
+    "botbuilder": "^4.23.3",
+    "botbuilder-dialogs": "^4.23.3",
+    "botframework-connector": "^4.23.3",
+    "botframework-schema": "^4.23.3",
     "cors": "^2.8.5",
-    "dotenv": "^16.0.3",
-    "express": "^4.18.2",
-    "express-rate-limit": "^7.5.0",
-    "html-entities": "^1.4.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "html-entities": "^2.6.0",
     "ioredis": "*",
     "memorystorage": "^0.12.0",
     "mongodb": "*",
     "mysql2": "*",
-    "uuid": "^9.0.0"
+    "uuid": "^14.0.1"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.4",
-    "esbuild": "^0.18.20",
-    "eslint": "^9.39.4",
+    "@eslint/js": "^10.0.1",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.5.0",
     "globals": "^17.4.0",
-    "nodemon": "~2.0.4"
+    "nodemon": "^3.1.14"
+  },
+  "overrides": {
+    "uuid": "$uuid",
+    "fast-xml-parser": "^5.7.0"
   }
 }

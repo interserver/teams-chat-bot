@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-/* eslint-disable no-console */
 // Replay / inspect the notification consumer trace log.
 //
 // The consumer writes JSONL events to .logs/notif-trace-YYYY-MM-DD.jsonl —

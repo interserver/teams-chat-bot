@@ -4,11 +4,11 @@
 const path = require('path');
 const express = require('express');
 const dotenv = require('dotenv');
-const rateLimit = require('express-rate-limit');
+const { rateLimit } = require('express-rate-limit');
 
 // Load environment variables from .env file
 const ENV_FILE = path.join(__dirname, '../.env');
-dotenv.config({ path: ENV_FILE });
+dotenv.config({ path: ENV_FILE, quiet: true });
 
 // Validate required env vars before anything else
 const { validateEnv } = require('./validateEnv');
@@ -22,27 +22,15 @@ const server = express();
 // ---------------------------------------------------------------------------
 const apiLimiter = rateLimit({
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10),  // 1 minute
-    max: parseInt(process.env.RATE_LIMIT_MAX || '60', 10),                 // 60 req/min per IP
+    limit: parseInt(process.env.RATE_LIMIT_MAX || '60', 10),               // 60 req/min per IP
     standardHeaders: true,
     legacyHeaders: false,
-    validateXForwardedForHeader: false,  // Don't error when X-Forwarded-For is set but proxy isn't trusted
+    validate: { xForwardedForHeader: false },  // Don't error when X-Forwarded-For is set but proxy isn't trusted
     message: { error: 'Too many requests, please try again later.' }
 });
 
-// Stricter limit for proactive-send endpoints to prevent accidental hammering
-const sendLimiter = rateLimit({
-    windowMs: parseInt(process.env.RATE_LIMIT_SEND_WINDOW_MS || '60000', 10),
-    max: parseInt(process.env.RATE_LIMIT_SEND_MAX || '30', 10),
-    standardHeaders: true,
-    legacyHeaders: false,
-    validateXForwardedForHeader: false,
-    message: { error: 'Send limit exceeded, please slow down.' },
-    keyGenerator: (req) => {
-        // Rate limit by channel + IP so each channel gets its own quota
-        const channel = req.body && req.body.channel ? `:${ req.body.channel }` : '';
-        return `${ req.ip }${ channel }`;
-    }
-});
+// Note: the stricter per-channel send limiter lives in server/api/index.js,
+// applied directly to the proactive-send routes.
 
 const { startConsumer, stopConsumer, getHealth: getQueueHealth } = require('./queue/notificationConsumer');
 const { botActivityHandler } = require('./api/botController');
@@ -65,8 +53,9 @@ server.get('/health/queue', async (_req, res) => {
     }
 });
 
-// Handle undefined routes
-server.get('*', (req, res) => {
+// Handle undefined routes (Express 5: bare '*' is no longer a valid path —
+// use a final catch-all middleware instead)
+server.use((req, res) => {
     res.status(404).json({ error: 'Route not found' });
 });
 
