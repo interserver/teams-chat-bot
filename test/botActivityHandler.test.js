@@ -1,4 +1,4 @@
-const { describe, it } = require('node:test');
+const { describe, it, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 // Test the utility methods extracted to the BotActivityHandler class.
@@ -7,7 +7,14 @@ const assert = require('node:assert/strict');
 
 // isValidIP and isValidHostname are instance methods on the prototype,
 // so we can call them with a dummy `this`.
-const proto = require('../server/bot/botActivityHandler').BotActivityHandler.prototype;
+const { BotActivityHandler } = require('../server/bot/botActivityHandler');
+const proto = BotActivityHandler.prototype;
+
+// After tests, forcibly exit since the module creates DB connections at load time
+// (via botController.js singleton) that keep the process alive.
+after(() => {
+    setTimeout(() => process.exit(0), 100);
+});
 
 describe('isValidIP', () => {
     it('accepts valid IPv4', () => {
