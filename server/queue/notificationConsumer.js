@@ -21,10 +21,11 @@ const trace = require('./notifTrace');
 
 const POLL_INTERVAL_MS = parseInt(process.env.NOTIF_POLL_MS || '5000', 10);
 const POLL_INTERVAL_FAST_MS = parseInt(process.env.NOTIF_POLL_FAST_MS || '1000', 10);
-const MAX_PER_TICK = parseInt(process.env.NOTIF_MAX_PER_TICK || '50', 10);
+const MAX_PER_TICK = parseInt(process.env.NOTIF_MAX_PER_TICK || '150', 10);
 const COALESCE_MAX_CHARS = parseInt(process.env.NOTIF_COALESCE_MAX_CHARS || '24000', 10);
 const COALESCE_MAX_ITEMS = parseInt(process.env.NOTIF_COALESCE_MAX_ITEMS || '8', 10);
 const EDIT_WINDOW_MS = parseInt(process.env.NOTIF_EDIT_WINDOW_MS || String(30 * 60 * 1000), 10);
+const NOTIF_PR_BRANCH_TTL_MS = parseInt(process.env.NOTIF_PR_BRANCH_TTL_MS || String(24 * 60 * 60 * 1000), 10);
 const KEY_PREFIX = process.env.NOTIF_KEY_PREFIX || 'notif:';
 const HEARTBEAT_MS = parseInt(process.env.NOTIF_HEARTBEAT_MS || '60000', 10);
 const APPEND_BREAK = '\n\n— · —\n\n';
@@ -260,7 +261,7 @@ async function recordPrBranch(repo, branch, prNumber) {
         await redis.set(
             prBranchKey(repo, branch),
             String(prNumber),
-            'PX', EDIT_WINDOW_MS
+            'PX', NOTIF_PR_BRANCH_TTL_MS
         );
     } catch (err) {
         console.warn(`[notif] recordPrBranch failed for ${ repo }/${ branch }: ${ err.message }`);
@@ -478,6 +479,17 @@ function normalizeGithubDedup(it) {
             // Set _commit_sha to a stable PR-scoped value so isGithubAppend
             // in tryEdit is true for events in the same PR trackable.
             extra._commit_sha = `pr:${ repo }:${ prNumber }`;
+        }
+        return;
+    }
+
+    // release events have no commit SHA but use tag_name for dedup
+    if (eventType === 'release') {
+        const tagName = data.release?.tag_name;
+        const repo = extra.repo;
+        if (tagName && repo) {
+            extra.dedup_key = `github:release:${ repo }:${ tagName }`;
+            extra._commit_sha = `release:${ repo }:${ tagName }`;
         }
         return;
     }
@@ -2480,7 +2492,7 @@ module.exports = {
     // exported for !notif wfactive and tests
     parseDownstreamMap, isActionTriggeredPush, findParentSha, recordActiveWorkflow,
     wfactiveKey, DOWNSTREAM_REPOS,
-    EDIT_WINDOW_MS,
+    EDIT_WINDOW_MS, NOTIF_PR_BRANCH_TTL_MS,
     // announce-redirect helpers (also used by tests)
     parseRepoPatterns, repoMatchesPattern, decideAnnounceRedirect,
     // batched-merge helpers (also used by tests)
@@ -2489,5 +2501,6 @@ module.exports = {
     _setInternalsForTest, handleTrackable, tryEdit, handleSingleNew,
     buildConstructedConvRef,
     attachPrContext, recordPrBranch, lookupPrByBranch,
-    prBranchKey, prNumberFromIssue, branchFromRef
+    prBranchKey, prNumberFromIssue, branchFromRef,
+    normalizeGithubDedup
 };

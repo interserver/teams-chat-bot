@@ -1,7 +1,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { mergeGithubTrackable, parseDownstreamMap, isActionTriggeredPush } = require('../server/queue/notificationConsumer');
+const { mergeGithubTrackable, parseDownstreamMap, isActionTriggeredPush, normalizeGithubDedup, NOTIF_PR_BRANCH_TTL_MS } = require('../server/queue/notificationConsumer');
 
 // The renderer uses regular Markdown nested bullets (ASCII spaces) when
 // the tree never goes deeper than Teams' single level of native nesting,
@@ -677,5 +677,73 @@ describe('mergeGithubTrackable — deployment events grouped by commit SHA', () 
         // Both deployment_status events should be in the same trackable
         assert.ok(r2.text.includes('in_progress'), 'first status should be present');
         assert.ok(r2.text.includes('success'), 'second status should be present');
+    });
+});
+
+describe('normalizeGithubDedup — release event dedup key', () => {
+    it('sets github:release:{repo}:{tag_name} dedup_key for release events', () => {
+        const it = {
+            env: {
+                extra: {
+                    event_type: 'release',
+                    repo: 'detain/sugarcraft',
+                    data: {
+                        release: {
+                            tag_name: 'v1.2.3',
+                            target_commitish: 'abc123'
+                        }
+                    }
+                }
+            }
+        };
+        normalizeGithubDedup(it);
+        assert.equal(it.env.extra.dedup_key, 'github:release:detain/sugarcraft:v1.2.3');
+        assert.equal(it.env.extra._commit_sha, 'release:detain/sugarcraft:v1.2.3');
+    });
+
+    it('release events return early without setting _commit_sha to a commit SHA', () => {
+        const it = {
+            env: {
+                extra: {
+                    event_type: 'release',
+                    repo: 'my/repo',
+                    data: {
+                        release: {
+                            tag_name: 'v2.0.0'
+                        }
+                    }
+                }
+            }
+        };
+        normalizeGithubDedup(it);
+        // _commit_sha should be the release-scoped value, not a commit SHA
+        assert.equal(it.env.extra._commit_sha, 'release:my/repo:v2.0.0');
+        // The target_commitish from extractCommitSha should NOT override
+        assert.ok(!it.env.extra._commit_sha.includes('abc123'), '_commit_sha should not be target_commitish');
+    });
+
+    it('release events with missing tag_name do not set dedup_key', () => {
+        const it = {
+            env: {
+                extra: {
+                    event_type: 'release',
+                    repo: 'detain/sugarcraft',
+                    data: {
+                        release: {
+                            target_commitish: 'abc123'
+                        }
+                    }
+                }
+            }
+        };
+        normalizeGithubDedup(it);
+        assert.equal(it.env.extra.dedup_key, undefined);
+        assert.equal(it.env.extra._commit_sha, undefined);
+    });
+});
+
+describe('NOTIF_PR_BRANCH_TTL_MS env var', () => {
+    it('defaults to 24 hours in milliseconds (86400000)', () => {
+        assert.equal(NOTIF_PR_BRANCH_TTL_MS, 86400000);
     });
 });

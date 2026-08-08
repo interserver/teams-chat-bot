@@ -46,7 +46,7 @@ Every `server/commands/*.js` exports `{ match, execute }`. `deps` = `{ context, 
 Never `new BotFrameworkAdapter(...)` outside `server/lib/adapter.js`. Wrap every outbound Bot Framework call in `runWithRetry(fn, { label, serviceUrl, maxRetries })`.
 
 ### Notification envelopes
-`notif:queue` JSON envelopes: `{ channel, text|attachments, extra?: { dedup_key }, fallback_webhook_url? }`. `extra.dedup_key` enables edit-window coalescing (`NOTIF_EDIT_WINDOW_MS`, 30 min). GitHub commit events auto-get `dedup_key=github:commit:{sha7}`.
+`notif:queue` JSON envelopes: `{ room, text|attachments, extra?: { dedup_key }, fallback_webhook_url? }`. `extra.dedup_key` enables edit-window coalescing (`NOTIF_EDIT_WINDOW_MS`, 30 min). GitHub commit events auto-get `dedup_key=github:commit:{sha7}`.
 
 ### Channel routing
 Always `resolve(roomName)` from `server/queue/channels.js`. Never hardcode `19:*@thread.v2` IDs.
