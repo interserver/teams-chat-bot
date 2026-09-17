@@ -16,6 +16,16 @@ adapter.onTurnError = async (context, error) => {
     const errorMsg = error.message || 'Oops. Something went wrong!';
     console.error(`\n [onTurnError] unhandled error: ${ error }`);
 
+    // Teams rejects activities whose serialized JSON exceeds ~25 KB. The SDK
+    // routes that RestError here; there is nothing useful to retry or reply
+    // with, and a trace/apology send risks the same failure on a proactive
+    // turn where nobody is waiting. Flag it for the sender to fix upstream.
+    const isSizeError = error.statusCode === 413 || /message size too large|request entity too large/i.test(errorMsg);
+    if (isSizeError) {
+        console.error('[onTurnError] Message too large for Teams — outbound payload exceeded the ~25 KB limit. Sender should use server/lib/messageSize.js guards.');
+        return;
+    }
+
     const isTransient = /ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(errorMsg);
     const isAuthError = /authorization has been denied|401|unauthorized/i.test(errorMsg);
 

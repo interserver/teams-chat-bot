@@ -11,6 +11,7 @@ alwaysApply: false
 - Admin-only: `if (deps.ima !== 'admin') return null;` FIRST line of `match`.
 - `deps` = `{ context, member, email, ima, db, redis, usersCollection, execFileAsync, bot }` — destructure only what you use.
 - Reply via `context.sendActivity(MessageFactory.text(...))` from `botbuilder`.
+- Cap user/API-supplied text before replying: `charCut(text, n)` per field + a final `fitTextActivity(text)` backstop from `../lib/messageSize` (see `githubIssues.js`). Oversized cards `trimCard()` then degrade to plain text (see `dailyRecap.js`).
 - Card-submit handlers read `context.activity.value.msteams.type` (see `server/commands/ticketSubmit.js`).
 - Update edits: `context.updateActivity({ type: 'message', id: context.activity.value.activityId, conversation: context.activity.conversation, ... })`.
 - Register the module in the `commands` array in `server/commands/index.js`. Order matters — first match wins.

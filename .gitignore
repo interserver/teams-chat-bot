@@ -41,7 +41,8 @@ node_modules/
 .DS_Store
 
 # build
-lib/
+/lib/
+/dist/
 
 # Caliber local state
 .caliber/

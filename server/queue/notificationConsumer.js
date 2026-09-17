@@ -17,6 +17,15 @@ const { resolve: resolveChannel } = require('./channels');
 const { shouldSkip } = require('./filters');
 const { getAdapter } = require('../lib/adapter');
 const { createNotifRedis, createBotRedis, TEAMS_SERVICE_URL } = require('../lib/redis');
+const {
+    MAX_ACTIVITY_BYTES,
+    TRUNCATION_MARKER,
+    activityBytes,
+    textJsonBytes,
+    fitAttachmentsActivity,
+    splitTextIntoChunks,
+    truncateTextToBytes
+} = require('../lib/messageSize');
 const trace = require('./notifTrace');
 
 const POLL_INTERVAL_MS = parseInt(process.env.NOTIF_POLL_MS || '5000', 10);
@@ -30,6 +39,86 @@ const KEY_PREFIX = process.env.NOTIF_KEY_PREFIX || 'notif:';
 const HEARTBEAT_MS = parseInt(process.env.NOTIF_HEARTBEAT_MS || '60000', 10);
 const APPEND_BREAK = '\n\n— · —\n\n';
 const APPEND_TRAIL_SUMMARY_AFTER = 3;
+
+// ---------------------------------------------------------------------------
+// Oversized-activity guard (hard backstop)
+// ---------------------------------------------------------------------------
+//
+// Teams rejects any outbound activity whose serialized JSON exceeds ~25 KB
+// with `RestError: Message size too large`. The SDK routes that error into
+// `adapter.onTurnError` (server/api/botController.js) and SWALLOWS it, so
+// `continueConversation` resolves as success — runWithRetry, fallbackSend
+// and dead-letter never fire and the message is silently lost. Measuring
+// bytes BEFORE the send is therefore the only reliable defense; every send
+// and update in this file funnels through guardActivity().
+//
+// Never throws: an activity this function returns is always at most
+// MAX_ACTIVITY_BYTES serialized (or a minimal text stub if nothing else
+// can fit), so something always lands in the channel.
+function guardActivity(activity, room = 'unknown') {
+    const originalBytes = activityBytes(activity);
+    if (originalBytes <= MAX_ACTIVITY_BYTES) {
+        return { activity, wasGuarded: false, bytes: originalBytes };
+    }
+
+    const guarded = { ...activity };
+    const hasAttachments = Array.isArray(guarded.attachments) && guarded.attachments.length > 0;
+    let strategy;
+
+    if (hasAttachments) {
+        strategy = 'cards_trim_fit';
+        const { attachments, note } = fitAttachmentsActivity(guarded.attachments, guarded.text || '', MAX_ACTIVITY_BYTES);
+        guarded.attachments = attachments;
+        if (attachments.length === 0) delete guarded.attachments;
+        if (note) guarded.text = guarded.text ? `${ guarded.text }\n\n${ note }` : note;
+    } else if (typeof guarded.text === 'string') {
+        strategy = 'text_truncate';
+        // Budget against THIS activity's envelope (an `id`, channelData etc.
+        // add bytes too), not just the bare { type:'message', text } shape.
+        const overhead = activityBytes({ ...guarded, text: '' });
+        guarded.text = truncateTextToBytes(guarded.text, Math.max(0, MAX_ACTIVITY_BYTES - overhead));
+    } else {
+        strategy = 'unknown_shape';
+    }
+
+    if (activityBytes(guarded) > MAX_ACTIVITY_BYTES) {
+        // Best effort failed (e.g. a single card that won't fit even
+        // trimmed): downgrade to a small text-only activity.
+        strategy = 'strip_to_text_stub';
+        const note = '⚠️ Content exceeded Teams\' message size limit and was reduced.';
+        const base = typeof activity.text === 'string' ? activity.text : '';
+        const stub = { type: 'message' };
+        if (typeof guarded.id === 'string') stub.id = guarded.id;
+        // Budget against the stub's ACTUAL envelope — a preserved `id`
+        // costs bytes the bare { type:'message', text } shape ignores — and
+        // keep the explanatory note (truncate the base text, not the tail).
+        const stubOverhead = activityBytes({ ...stub, text: '' });
+        const suffix = base ? `\n\n${ note }` : '';
+        const stubBudget = Math.max(0, MAX_ACTIVITY_BYTES - stubOverhead - textJsonBytes(suffix));
+        stub.text = base ? `${ truncateTextToBytes(base, stubBudget, '') }${ suffix }` : note;
+        return finishGuard(stub, strategy, originalBytes, room);
+    }
+    return finishGuard(guarded, strategy, originalBytes, room);
+}
+
+function finishGuard(guarded, strategy, originalBytes, room) {
+    const finalBytes = activityBytes(guarded);
+    console.warn(`[notif] oversized activity guarded: ${ originalBytes } → ${ finalBytes } bytes (${ room })`);
+    trace.emit('oversized_guard', {
+        room,
+        strategy,
+        original_bytes: originalBytes,
+        final_bytes: finalBytes
+    });
+    return { activity: guarded, wasGuarded: true, bytes: finalBytes };
+}
+
+// A guarded edit leaves the ✂ truncation marker inside stored recent.text;
+// drop it when composing the next revision so stale markers never pile up
+// in the middle of a message across edit cycles.
+function stripTruncationMarker(text) {
+    return String(text ?? '').replaceAll(TRUNCATION_MARKER, '');
+}
 
 function k(name) { return KEY_PREFIX + name; }
 function recentKey(room) { return k('recent:') + room; }
@@ -1898,12 +1987,13 @@ async function tryEdit(room, it, recent, stats, options = {}) {
             mergeMode = 'standard_append';
             // ── Standard append mode (non-GitHub or different commit) ──────
             const appended = (recent.appended_count || 0) + 1;
+            const priorText = stripTruncationMarker(recent.text || '');
             if (appended <= APPEND_TRAIL_SUMMARY_AFTER) {
                 const ts = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
-                newText = `${ recent.text || '' }\n\n— update at ${ ts } (+${ appended }) —\n${ it.env.message || '' }`;
+                newText = `${ priorText }\n\n— update at ${ ts } (+${ appended }) —\n${ it.env.message || '' }`;
             } else {
                 const ts = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
-                const baseLine = (recent.text || '').split('\n')[0] || '';
+                const baseLine = priorText.split('\n')[0] || '';
                 newText = `${ baseLine }\n\n— ${ appended } updates · last ${ ts } — most recent: ${ it.env.message || '' }`;
             }
         }
@@ -1934,13 +2024,18 @@ async function tryEdit(room, it, recent, stats, options = {}) {
         incoming: trace.snapshotEnvelope(it.env)
     });
 
+    // tryEdit updates a tracked activity in place — chunking is not an
+    // option here, so the guard truncates with the ✂ marker instead.
+    const outbound = newCard
+        ? buildCardActivity(newCard, recent.activityId)
+        : { type: 'message', id: recent.activityId, text: newText };
+    const { activity: safeActivity } = guardActivity(outbound, room);
+    if (!newCard && typeof safeActivity.text === 'string') newText = safeActivity.text;
+
     try {
         await runWithRetry(async () => {
             await adapter.continueConversation(conversationRef, async (proactiveContext) => {
-                const activity = newCard
-                    ? buildCardActivity(newCard, recent.activityId)
-                    : { type: 'message', id: recent.activityId, text: newText };
-                await proactiveContext.updateActivity(activity);
+                await proactiveContext.updateActivity(safeActivity);
             });
         }, {
             label: `notif edit ${ room }`,
@@ -1970,7 +2065,9 @@ async function tryEdit(room, it, recent, stats, options = {}) {
         activityId: recent.activityId,
         ts: Date.now(),
         type: it.env.type,
-        text: newText || recent.text,
+        // `??` not `||`: a guarded truncation can legitimately yield '' and
+        // must not resurrect the pre-edit text.
+        text: newText != null ? newText : recent.text,
         header: newHeader,
         items: newItems,
         header_identity: newHeaderIdentity,
@@ -2068,10 +2165,11 @@ async function handleSingleNew(room, it, stats, options = {}) {
         batched: groupItems.length > 1 ? groupItems.length : undefined
     });
     let activityId = null;
+    const { activity: safeActivity } = guardActivity(activity, room);
     try {
         await runWithRetry(async () => {
             await adapter.continueConversation(conversationRef, async (proactiveContext) => {
-                const sent = await proactiveContext.sendActivity(activity);
+                const sent = await proactiveContext.sendActivity(safeActivity);
                 activityId = sent && sent.id ? sent.id : null;
             });
         }, {
@@ -2179,18 +2277,60 @@ async function sendCombinedText(room, conversationRef, msgItems, stats) {
     console.log(`[notif] ⊕ coalesce(text) room=${ room } items=${ included }${ leftover.length ? ' leftover=' + leftover.length : '' } "${ preview(combined) }"`);
     trace.emit('coalesce_text_attempt', {
         room, items_in: included, leftover: leftover.length,
-        bytes: combined.length, text: combined
+        bytes: activityBytes({ type: 'message', text: combined }), text: combined
     });
+    // COALESCE_MAX_CHARS above is the first line of defense (JS chars);
+    // chunking on the serialized byte budget is the hard backstop — emoji
+    // and JSON escaping mean 24 K chars can still exceed Teams' ~25 KB.
+    // A splitter failure must never kill the tick (batch would strand in
+    // notif:processing and crash-loop on restart) — degrade to one
+    // guard-truncated message instead.
+    let chunks;
+    try {
+        chunks = splitTextIntoChunks(combined, MAX_ACTIVITY_BYTES, APPEND_BREAK);
+    } catch (err) {
+        console.error(`[notif] chunk split failed for ${ room } (${ err.message }) — sending guard-truncated single`);
+        chunks = [combined];
+    }
+    if (chunks.length > 1) {
+        trace.emit('oversized_guard', {
+            room,
+            strategy: 'text_chunks',
+            original_bytes: activityBytes({ type: 'message', text: combined }),
+            final_bytes: Math.max(...chunks.map(chunk => activityBytes({ type: 'message', text: chunk }))),
+            chunks: chunks.length
+        });
+    }
+    // At-least-once semantics: a retry that lands mid-list must not re-post
+    // chunks Teams already delivered (posted messages are immutable), so
+    // `sentThrough` lives OUTSIDE the retried closure and the send loop
+    // resumes from it. Content that never landed falls through to
+    // fallbackSend below.
+    let sentThrough = 0;
     try {
         await runWithRetry(async () => {
             await adapter.continueConversation(conversationRef, async (proactiveContext) => {
-                await proactiveContext.sendActivity({ type: 'message', text: combined });
+                // One proactive turn, ordered chunk sends — never lose content.
+                for (let i = sentThrough; i < chunks.length; i++) {
+                    const { activity: safeActivity } = guardActivity({ type: 'message', text: chunks[i] }, room);
+                    await proactiveContext.sendActivity(safeActivity);
+                    sentThrough = i + 1;
+                }
             });
         }, { label: `notif coalesce ${ room }`, serviceUrl: conversationRef.serviceUrl, maxRetries: 3 });
     } catch (err) {
         console.warn(`[notif] coalesced send failed for ${ room }: ${ err.message }`);
-        trace.emit('coalesce_text_failed', { room, error: err.message });
-        await fallbackSend(room, msgItems.slice(0, included), stats, 'send_failed:' + err.message);
+        // Items whose full text is contained in the delivered prefix are
+        // not re-posted — at-least-once bias only for what might be missing.
+        const deliveredItems = countDeliveredItems(chunks, sentThrough, msgItems, included);
+        if (sentThrough > 0) {
+            trace.emit('chunk_partial_failure', {
+                room, sent_chunks: sentThrough, total_chunks: chunks.length,
+                delivered_items: deliveredItems, error: err.message
+            });
+        }
+        trace.emit('coalesce_text_failed', { room, error: err.message, sent_chunks: sentThrough });
+        await fallbackSend(room, msgItems.slice(deliveredItems, included), stats, 'send_failed:' + err.message);
         for (const it of leftover) await fallbackSend(room, [it], stats, 'leftover_after_failure');
         return;
     }
@@ -2209,6 +2349,25 @@ async function sendCombinedText(room, conversationRef, msgItems, stats) {
     }
 }
 
+// Chunks re-concatenate to `combined` losslessly, so the delivered prefix
+// (char length of chunks[0..sentThrough-1]) maps back onto whole coalesced
+// items — items fully inside it must not be re-posted via fallbackSend.
+// Partially-delivered items are counted as NOT delivered (at-least-once).
+function countDeliveredItems(chunks, sentThrough, msgItems, included) {
+    let deliveredChars = 0;
+    for (let i = 0; i < sentThrough && i < chunks.length; i++) deliveredChars += chunks[i].length;
+    let covered = 0;
+    let deliveredItems = 0;
+    for (let i = 0; i < included; i++) {
+        const start = i === 0 ? 0 : covered + APPEND_BREAK.length;
+        const end = start + (msgItems[i].env.message || '').length;
+        if (end > deliveredChars) break;
+        covered = end;
+        deliveredItems = i + 1;
+    }
+    return deliveredItems;
+}
+
 async function sendCombinedCards(room, conversationRef, cardItems, stats) {
     const max = Math.min(cardItems.length, COALESCE_MAX_ITEMS);
     const attachments = [];
@@ -2219,10 +2378,11 @@ async function sendCombinedCards(room, conversationRef, cardItems, stats) {
         }
     }
     console.log(`[notif] ⊕ coalesce(cards) room=${ room } items=${ max } attachments=${ attachments.length }`);
+    const { activity: safeCardActivity } = guardActivity({ type: 'message', attachments }, room);
     try {
         await runWithRetry(async () => {
             await adapter.continueConversation(conversationRef, async (proactiveContext) => {
-                await proactiveContext.sendActivity({ type: 'message', attachments });
+                await proactiveContext.sendActivity(safeCardActivity);
             });
         }, { label: `notif card-coalesce ${ room }`, serviceUrl: conversationRef.serviceUrl, maxRetries: 3 });
     } catch (err) {
@@ -2389,13 +2549,14 @@ function buildConstructedConvRef(room, conversationId) {
 // Returns the new activity id on success, null on failure.
 async function tryConstructedConvRef(room, conversationId, activity, _stats) {
     const constructedRef = buildConstructedConvRef(room, conversationId);
+    const { activity: safeActivity } = guardActivity(activity, room);
     console.log(`[notif] → trying constructed convref room=${ room } conv=${ shortConv(conversationId) } serviceUrl=${ TEAMS_SERVICE_URL }`);
     trace.emit('constructed_convref_attempt', { room, conversation_id: conversationId, op: 'send' });
     let activityId = null;
     try {
         await runWithRetry(async () => {
             await adapter.continueConversation(constructedRef, async (proactiveContext) => {
-                const sent = await proactiveContext.sendActivity(activity);
+                const sent = await proactiveContext.sendActivity(safeActivity);
                 activityId = sent && sent.id ? sent.id : null;
             });
         }, {
@@ -2498,7 +2659,7 @@ module.exports = {
     // batched-merge helpers (also used by tests)
     groupTrackableByDedup, canBatchMergeGroup, handleTrackableBatch,
     // exported for tests only — do not call from production code
-    _setInternalsForTest, handleTrackable, tryEdit, handleSingleNew,
+    _setInternalsForTest, handleTrackable, tryEdit, handleSingleNew, handleCoalesced, guardActivity,
     buildConstructedConvRef,
     attachPrContext, recordPrBranch, lookupPrByBranch,
     prBranchKey, prNumberFromIssue, branchFromRef,

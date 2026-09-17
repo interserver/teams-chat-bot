@@ -1,8 +1,21 @@
 const { MessageFactory } = require('botbuilder');
 const { Octokit } = require('@octokit/rest');
 
+const { fitTextActivity, charCut } = require('../lib/messageSize');
+
 const OWNER = process.env.GITHUB_OWNER || 'interserver';
 const REPO = process.env.GITHUB_REPO || 'my';
+
+const ISSUE_BODY_MAX_CHARS = 3000;
+const COMMENT_BODY_MAX_CHARS = 800;
+
+// Cap long user-supplied fields so a giant issue body or 30-comment thread
+// cannot blow past Teams' ~25 KB serialized-message limit. charCut backs the
+// slice off a split emoji so the truncation never emits a lone surrogate.
+function clampField(value, maxChars) {
+    const text = String(value ?? '');
+    return text.length > maxChars ? `${ charCut(text, maxChars) }…` : text;
+}
 
 let octokit;
 function getOctokit() {
@@ -69,17 +82,19 @@ module.exports = {
                 const comments = commentsRes.data;
                 const labels = labelsRes.data;
                 let text = `**Issue #${ issue.number } ${ issue.title }**\n`;
-                text += `${ issue.body || '(no description)' } by [${ issue.user.login }](${ issue.user.html_url }) on ${ issue.updated_at }\n`;
+                text += `${ clampField(issue.body || '(no description)', ISSUE_BODY_MAX_CHARS) } by [${ issue.user.login }](${ issue.user.html_url }) on ${ issue.updated_at }\n`;
                 if (labels.length > 0) {
                     text += `**Labels:** ${ labels.map(l => l.name).join(', ') }\n`;
                 }
                 if (comments.length > 0) {
                     text += '**Comments**\n';
                     for (const c of comments) {
-                        text += `[${ c.user.login }](${ c.user.html_url }) said: ${ c.body } on ${ c.updated_at }\n`;
+                        text += `[${ c.user.login }](${ c.user.html_url }) said: ${ clampField(c.body, COMMENT_BODY_MAX_CHARS) } on ${ c.updated_at }\n`;
                     }
                 }
-                await context.sendActivity(MessageFactory.text(text));
+                // Final byte-fit backstop: per-field caps keep the common case
+                // small, but many long comments can still stack up.
+                await context.sendActivity(MessageFactory.text(fitTextActivity(text)));
                 break;
             }
             case 'close': {

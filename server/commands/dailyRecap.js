@@ -1,11 +1,23 @@
 const { CardFactory, MessageFactory, TurnContext } = require('botbuilder');
 const axios = require('axios');
 const { bindCard, scheduleAutoDelete, AUTO_DELETE_MS } = require('../api/dailyRecapController');
+const { MAX_ACTIVITY_BYTES, activityBytes, trimCard, fitTextActivity } = require('../lib/messageSize');
 
 // Shared with the daily_recap_card_api.php endpoint on MyAdmin.
 const RECAP_URL = process.env.DAILY_RECAP_URL
     || 'https://mystage.interserver.net/admin/ajax/daily_recap_card_api.php';
 const RECAP_TOKEN = process.env.DAILY_RECAP_TOKEN || '';
+
+// Best-effort plain-text digest used when the card itself cannot fit Teams'
+// message size limit — keep the day's numbers visible, never lose the recap.
+function recapFallbackText(data) {
+    const stats = data && Array.isArray(data.stats) ? data.stats : [];
+    const lines = stats
+        .slice(0, 20)
+        .map(s => `- ${ s.name || s.title || s.label || 'Service' }${ s.total != null ? `: ${ s.total }` : '' }`);
+    const header = '⚠️ Daily recap card exceeded the Teams message size limit and was reduced to this summary.';
+    return lines.length > 0 ? `${ header }\n\n${ lines.join('\n') }` : header;
+}
 
 module.exports = {
     match(text, lcText, { ima }) {
@@ -64,14 +76,22 @@ module.exports = {
             ));
             return;
         }
-        const cardSize = JSON.stringify(card).length;
-        if (cardSize > 25 * 1024) {
-            console.warn(`[dailyRecap] bound card is ${ Math.round(cardSize / 1024) } KB — Teams' 25 KB limit may drop it`);
+        // Hard guard against Teams' ~25 KB serialized-activity limit: trim
+        // the card, and if even a trimmed card cannot fit, send a short
+        // plain-text summary instead of an oversized activity the SDK would
+        // silently swallow (the RestError dies inside adapter.onTurnError).
+        let outboundCard = card;
+        let activity = { type: 'message', attachments: [CardFactory.adaptiveCard(outboundCard)] };
+        if (activityBytes(activity) > MAX_ACTIVITY_BYTES) {
+            outboundCard = trimCard(outboundCard);
+            activity = { type: 'message', attachments: [CardFactory.adaptiveCard(outboundCard)] };
         }
-        const sent = await context.sendActivity({
-            type: 'message',
-            attachments: [CardFactory.adaptiveCard(card)]
-        });
+        if (activityBytes(activity) > MAX_ACTIVITY_BYTES) {
+            console.warn(`[dailyRecap] recap card still ${ activityBytes(activity) } bytes after trimming — sending text fallback`);
+            await context.sendActivity(MessageFactory.text(fitTextActivity(recapFallbackText(data))));
+            return;
+        }
+        const sent = await context.sendActivity(activity);
         // Auto-delete the recap after AUTO_DELETE_MS so it doesn't clutter
         // the channel.  Capture the conversation reference now while we're
         // still inside the turn — the timer fires after the turn ends.

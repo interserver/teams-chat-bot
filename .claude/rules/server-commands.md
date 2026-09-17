@@ -10,6 +10,7 @@ paths:
 - Admin-only: `if (deps.ima !== 'admin') return null;` as the FIRST line of `match`.
 - `deps` is `{ context, member, email, ima, db, redis, usersCollection, execFileAsync, bot }` — destructure only what you use.
 - Reply via `context.sendActivity(MessageFactory.text(...))` (import from `botbuilder`).
+- Cap anything user- or API-supplied before replying: `charCut(text, n)` per field plus a final `fitTextActivity(text)` backstop from `../lib/messageSize` (see `server/commands/githubIssues.js`). Card replies must `trimCard()` and degrade to plain text when still oversized (see `server/commands/dailyRecap.js`) — Teams silently drops activities over ~25 KB.
 - Card-submit handlers read `context.activity.value.msteams.type` — see `server/commands/ticketSubmit.js`.
 - Update card edits via `context.updateActivity({ type: 'message', id: context.activity.value.activityId, conversation: context.activity.conversation, text/attachments })`.
 - Register every new module in the `commands` array in `server/commands/index.js`. Order matters — first match wins.

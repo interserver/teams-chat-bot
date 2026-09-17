@@ -8,9 +8,10 @@ alwaysApply: false
 
 - `node:test` only — `const { describe, it, before, beforeEach, after } = require('node:test')` + `const assert = require('node:assert/strict')`. No Jest, no Mocha.
 - `process.env.NOTIF_TRACE_LOG = '0'` at the top of any test requiring `server/queue/notificationConsumer.js`.
-- Consumer/adapter mock seam: `consumer._setInternalsForTest({ redis, redisBot, adapter })` returns originals; restore in `after()`. Canonical: `test/notifBatchMerge.test.js`, `test/notifConvrefFallback.test.js`.
+- Consumer/adapter mock seam: `consumer._setInternalsForTest({ redis, redisBot, adapter })` returns originals; restore in `after()`. Canonical: `test/notifBatchMerge.test.js`, `test/notifConvrefFallback.test.js`, `test/notifOversizedGuard.test.js`.
 - Mock Redis: support `get`/`set`/`hget`/`hset`/`hgetall`/`incr`/`pipeline`/`expire`/`lrem`. Seed `_lists.set('notif:processing', [...rawValues])` and assert empty after the tick.
 - Adapter mock records `_calls[]` = `{ conversationRef, sentActivities, updatedActivities }`. `continueConversation(ref, cb)` builds a fake `context` that pushes into the record.
+- Size-guard assertions measure `Buffer.byteLength(JSON.stringify(activity), 'utf8')` against `MAX_ACTIVITY_BYTES` and check chunking is lossless — see `test/messageSize.test.js`, `test/notifOversizedGuard.test.js`.
 - Every new command regex MUST get a `match()` assertion in `test/commands.test.js`.
 - ⚠️ `test/botActivityHandler.test.js` hangs at end of run (unclosed Mongo/MySQL/Redis). When running the full suite, list other files explicitly.
 - Single-file foreground: `node --test test/<file>.test.js 2>&1 | tail -25`.

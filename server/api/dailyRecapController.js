@@ -34,6 +34,7 @@ const { createBotRedis } = require('../lib/redis');
 const { Template } = require('adaptivecards-templating');
 const { runWithRetry } = require('../lib/retry');
 const { CHANNELS } = require('../queue/channels');
+const { trimCard, activityBytes, MAX_ACTIVITY_BYTES } = require('../lib/messageSize');
 
 const RECAP_REDIS_TTL = 60 * 60 * 24 * 2; // 2 days — long enough for the chat user to interact with the card
 // Auto-delete the recap card from the channel after this many ms.  The
@@ -135,48 +136,11 @@ async function sendProactiveCard(conversationReference, card) {
 
 // ---------------------------------------------------------------------------
 // Attempt to reduce card size to fit within Teams' 25 KB limit.
-// Returns the modified card object (may be the same reference if already small).
-// Strips large image URLs, truncates long text fields, and removes empty arrays.
+// Returns a trimmed clone (input is never mutated). The recursive algorithm
+// lives in server/lib/messageSize.js so every card path shares one limiter.
 // ---------------------------------------------------------------------------
 function enforceCardSizeLimit(card) {
-    const clone = JSON.parse(JSON.stringify(card));
-    _enforceRecursive(clone, 0);
-    return clone;
-}
-
-function _enforceRecursive(obj, depth) {
-    if (depth > 20) return; // prevent stack overflow on deeply nested cards
-    if (!obj || typeof obj !== 'object') return;
-
-    if (Array.isArray(obj)) {
-        for (const item of obj) _enforceRecursive(item, depth + 1);
-        return;
-    }
-
-    // Truncate long text values
-    if (typeof obj.text === 'string' && obj.text.length > 2000) {
-        obj.text = obj.text.slice(0, 2000) + '…';
-    }
-    if (typeof obj.speak === 'string' && obj.speak.length > 1000) {
-        obj.speak = obj.speak.slice(0, 1000) + '…';
-    }
-
-    // Remove base64 image URLs (they bloat the card)
-    if (typeof obj.url === 'string' && obj.url.startsWith('data:')) {
-        obj.url = '';
-    }
-    if (typeof obj.image === 'string' && obj.image.startsWith('data:')) {
-        obj.image = '';
-    }
-
-    // Trim empty arrays to save space
-    for (const [key, val] of Object.entries(obj)) {
-        if (Array.isArray(val) && val.length === 0) {
-            delete obj[key];
-        } else {
-            _enforceRecursive(val, depth + 1);
-        }
-    }
+    return trimCard(card);
 }
 
 const dailyRecapHandler = async (req, res) => {
@@ -215,20 +179,37 @@ const dailyRecapHandler = async (req, res) => {
         return res.status(400).json({ ok: false, error: `template binding failed: ${ err.message }` });
     }
 
-    const cardJson = JSON.stringify(card);
-    const cardSize = cardJson.length;
-
-    // Enforce Teams' 25 KB Adaptive Card limit
+    // Enforce Teams' 25 KB Adaptive Card limit — measured in UTF-8 bytes,
+    // not JS chars: emoji and JSON escaping make `.length` lie.
+    let cardSize = Buffer.byteLength(JSON.stringify(card), 'utf8');
     if (cardSize > MAX_CARD_BYTES) {
         const originalSizeKB = Math.round(cardSize / 1024);
         card = enforceCardSizeLimit(card);
-        const newSize = JSON.stringify(card).length;
-        const newSizeKB = Math.round(newSize / 1024);
+        cardSize = Buffer.byteLength(JSON.stringify(card), 'utf8');
+        const newSizeKB = Math.round(cardSize / 1024);
         console.warn(`[dailyrecap] card ${ originalSizeKB } KB exceeded limit — trimmed to ${ newSizeKB } KB`);
-        if (newSize > MAX_CARD_BYTES) {
+        if (cardSize > MAX_CARD_BYTES) {
             return res.status(400).json({
                 ok: false,
                 error: `bound card is ${ originalSizeKB } KB (limit 25 KB) and could not be trimmed enough`
+            });
+        }
+    }
+
+    // Hard backstop: Teams measures the WHOLE serialized activity, not the
+    // card in isolation, and silently drops oversized sends (the RestError
+    // dies in onTurnError). Trim once more against the activity budget and
+    // 400 only when even the trimmed card cannot fit.
+    const probeActivity = c => ({
+        type: 'message',
+        attachments: [{ contentType: 'application/vnd.microsoft.card.adaptive', content: c }]
+    });
+    if (activityBytes(probeActivity(card)) > MAX_ACTIVITY_BYTES) {
+        card = enforceCardSizeLimit(card);
+        if (activityBytes(probeActivity(card)) > MAX_ACTIVITY_BYTES) {
+            return res.status(400).json({
+                ok: false,
+                error: `serialized activity exceeds Teams' ~${ MAX_ACTIVITY_BYTES }-byte limit even after trimming`
             });
         }
     }
@@ -265,7 +246,7 @@ const dailyRecapHandler = async (req, res) => {
         activityId,
         conversationId,
         channel,
-        bytes_sent:     JSON.stringify(card).length
+        bytes_sent:     Buffer.byteLength(JSON.stringify(card), 'utf8')
     });
 };
 

@@ -12,6 +12,7 @@ const { getAdapter } = require('../lib/adapter');
 const { createBotRedis } = require('../lib/redis');
 const { runWithRetry } = require('../lib/retry');
 const { resolve: resolveChannel } = require('../queue/channels');
+const { MAX_ACTIVITY_BYTES, activityBytes, fitTextActivity } = require('../lib/messageSize');
 
 // Channels to skip sending messages to. To re-enable a channel, remove it
 // from this array or set SKIP_CHANNELS="" in your .env file.
@@ -44,14 +45,26 @@ const msgHandler = async (req, res) => {
     if (!targetConversationId) {
         return res.status(400).json({ message: `unknown channel "${ roomName }"` });
     }
+    // Clamp to Teams' ~25 KB serialized-activity limit up front. If we let an
+    // oversized payload through, the SDK swallows the resulting
+    // `Message size too large` RestError in onTurnError and the caller would
+    // get a false 200 while nothing lands. Clamp — never reject.
+    let outboundText = message;
+    let truncated = false;
+    const requestedBytes = activityBytes({ type: 'message', text: message });
+    if (requestedBytes > MAX_ACTIVITY_BYTES) {
+        outboundText = fitTextActivity(message, MAX_ACTIVITY_BYTES);
+        truncated = true;
+        console.log(`[msg] oversized request from ${ req.ip } clamped: ${ requestedBytes } → ${ activityBytes({ type: 'message', text: outboundText }) } bytes`);
+    }
     try {
         const stored = await redis.get(`convref:${ targetConversationId }`);
         if (!stored) {
             return res.status(404).json({ message: 'no conversation reference found for ' + roomName });
         }
         const conversationReference = JSON.parse(stored);
-        await sendProactiveMessage(conversationReference, message);
-        res.json({ message: 'sent', channel: roomName });
+        await sendProactiveMessage(conversationReference, outboundText);
+        res.json(truncated ? { message: 'sent', channel: roomName, truncated: true } : { message: 'sent', channel: roomName });
     } catch (err) {
         console.error('[msgHandler] send failed:', err.message);
         res.status(500).json({ message: err.message });

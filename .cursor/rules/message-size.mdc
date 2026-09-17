@@ -1,0 +1,16 @@
+---
+description: Shared lib + Teams message-size guard conventions for server/lib/**
+globs: server/lib/**
+alwaysApply: false
+---
+
+# Shared Lib Conventions
+
+- `adapter.js` owns the single `BotFrameworkAdapter` (`getAdapter()` / `setAdapter()`); `redis.js` owns `createBotRedis()` / `createNotifRedis()` / `TEAMS_SERVICE_URL`; `retry.js` owns `runWithRetry(fn, opts)`. Never construct those clients elsewhere.
+- `messageSize.js` owns every outbound size guard. Teams rejects activities whose serialized JSON exceeds ~25 KB and the SDK swallows that `RestError` in `onTurnError`, so size MUST be measured before the send.
+- Measure with `activityBytes()` (`Buffer.byteLength(JSON.stringify(...), 'utf8')`). NEVER use JS `.length`.
+- Budget is `MAX_ACTIVITY_BYTES` (default 24000, override via `TEAMS_MAX_ACTIVITY_BYTES`) — headroom for the fields `continueConversation` stamps on.
+- Cut text through `truncateTextToBytes` / `fitTextActivity` / `safeCutIndex` / `charCut`, never raw `slice()` (lone surrogates).
+- Cards: `trimCard()` returns a trimmed clone (never mutate input); `fitCardActivity()` measures one pass; `fitAttachmentsActivity()` drops what will not fit and returns a `note`.
+- `splitTextIntoChunks()` MUST stay lossless — concatenated chunks reproduce the input.
+- Add new helpers to `module.exports` and cover them in `test/messageSize.test.js`.
