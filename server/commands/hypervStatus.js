@@ -1,5 +1,8 @@
 const { MessageFactory } = require('botbuilder');
 
+// MyAdmin service type id for HyperV (mystage include/config/service_types.php)
+const HYPERV_TYPE = 11;
+
 module.exports = {
     match(text, lcText, { ima }) {
         if (ima !== 'admin') return null;
@@ -10,7 +13,8 @@ module.exports = {
             const [rows] = await db.query(
                 `SELECT * FROM vps_masters
                 LEFT JOIN vps_master_details USING (vps_id)
-                WHERE vps_type = (SELECT type_id FROM vps_platform_types WHERE type_key = 'HYPERV' LIMIT 1)`
+                WHERE vps_type = ?`,
+                [HYPERV_TYPE]
             );
             if (!rows || rows.length === 0) {
                 await context.sendActivity(MessageFactory.text('No HyperV hosts found.'));
