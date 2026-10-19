@@ -390,6 +390,25 @@ function prNumberFromIssue(issue) {
 }
 
 /**
+ * One-line description of a GitHub `create` / `delete` event, built from
+ * the payload because the producer's default text doesn't say what was
+ * created or deleted. `withRepo` appends the repo link — needed when the
+ * line stands alone, redundant when it is nested under a PR / commit
+ * trackable whose header already names the repo. Returns null when the
+ * payload lacks `ref` / `ref_type`.
+ */
+function describeRefEvent(eventType, data, repo, { withRepo }) {
+    const ref = data.ref || '';
+    const refType = data.ref_type || '';
+    if (!ref || !refType) return null;
+    const sender = data.sender?.login || 'someone';
+    const verb = eventType === 'create' ? 'created' : 'deleted';
+    const emoji = eventType === 'create' ? '🌱' : '🗑️';
+    const line = `${ emoji } ${ sender } ${ verb } ${ refType } **${ ref }**`;
+    return withRepo ? `${ line } in [${ repo }](https://github.com/${ repo }).` : line;
+}
+
+/**
  * Reroute the envelope into a PR trackable when the event is implicitly
  * tied to a PR. Mutates `env.extra` (and `env.message` for `delete`
  * events). Returns a small descriptor that callers can use for tracing:
@@ -444,12 +463,10 @@ async function attachPrContext(env) {
     if (eventType === 'create' || eventType === 'delete') {
         const ref = data.ref || '';
         const refType = data.ref_type || '';
-        const sender = data.sender?.login || 'someone';
         const stubRe = new RegExp(`triggered\\s+a\\s+\\*?\\*?${ eventType }\\*?\\*?\\s+event`, 'i');
-        if (ref && refType && stubRe.test(env.message || '')) {
-            const verb = eventType === 'create' ? 'created' : 'deleted';
-            const emoji = eventType === 'create' ? '🌱' : '🗑️';
-            env.message = `${ emoji } ${ sender } ${ verb } ${ refType } \`${ ref }\` in [${ repo }](https://github.com/${ repo }).`;
+        const described = describeRefEvent(eventType, data, repo, { withRepo: true });
+        if (described && stubRe.test(env.message || '')) {
+            env.message = described;
         }
         if (refType === 'branch' && ref) {
             const prNumber = await lookupPrByBranch(repo, ref);
@@ -796,6 +813,11 @@ function condensedBulletText(env) {
             .find(l => l.trim().length > 0);
         return firstLine ? firstLine.trim() : null;
     }
+    if (eventType === 'create' || eventType === 'delete') {
+        // Branch create/delete nests under its PR's trackable, whose header
+        // already names the repo — drop the "in [repo](…)" tail.
+        return describeRefEvent(eventType, data, extra.repo || '', { withRepo: false });
+    }
     return null;
 }
 
@@ -1116,6 +1138,12 @@ function renderTrackable(header, items) {
     if (headerText) lines.push(headerText);
     lines.push(...flatBullets);
     renderChecksGrouped(checkItems, 1, lines);
+
+    // A multi-line header (PR/issue description, `> _commit msg_` quote,
+    // filter marker) needs a blank line before the bullets, or the list is
+    // read as a continuation of the header's last paragraph / quote instead
+    // of items nested under the notification as a whole.
+    if (headerText.includes('\n') && lines.length > 1) lines.splice(1, 0, '');
 
     if (lines.length === 0) return '';
 

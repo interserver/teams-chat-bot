@@ -747,3 +747,61 @@ describe('NOTIF_PR_BRANCH_TTL_MS env var', () => {
         assert.equal(NOTIF_PR_BRANCH_TTL_MS, 86400000);
     });
 });
+
+describe('mergeGithubTrackable — branch delete nested under its PR', () => {
+    // Shape of interserver/mailbaby-api-samples#1292: the PR closed event
+    // (announce-redirected, so it carries the filter marker) is the header,
+    // then the head branch's delete event lands as a bullet beneath it.
+    const REPO = 'interserver/mailbaby-api-samples';
+    const BRANCH = 'dependabot/maven/swagger-client/jaxrs-resteasy-eap/org.jboss.resteasy-resteasy-multipart-provider-4.7.8.Final';
+    const PR_HEADER =
+        `_filtered from notifications: repo opt-out: ${ REPO }_\n\n` +
+        `🔀 [detain](https://github.com/detain) **closed** pull request [#1292 Bump resteasy](https://github.com/${ REPO }/pull/1292) ` +
+        `in [${ REPO }](https://github.com/${ REPO }) (**${ BRANCH }** → **master**). ✅ Merged.\n\n\n\n` +
+        '> Bumps org.jboss.resteasy:resteasy-multipart-provider from 4.5.7.Final to 4.7.8.Final.';
+
+    function deleteEnv() {
+        return {
+            type: 'msg',
+            // As rewritten by attachPrContext — the standalone form keeps the repo.
+            message: `🗑️ detain deleted branch **${ BRANCH }** in [${ REPO }](https://github.com/${ REPO }).`,
+            extra: {
+                event_type: 'delete',
+                repo: REPO,
+                _commit_sha: `pr:${ REPO }:1292`,
+                dedup_key: `github:pr:${ REPO }:1292`,
+                data: { ref: BRANCH, ref_type: 'branch', sender: { login: 'detain' } }
+            }
+        };
+    }
+
+    it('renders the delete as a bold-ref bullet without the repo, a blank line below the body', () => {
+        // Header as saved by handleSingleNew on the first send (unsplit).
+        const recent = { header: PR_HEADER, items: [], header_identity: `pr:${ REPO }:1292:closed:92a86e7` };
+        const merged = mergeGithubTrackable(recent, deleteEnv());
+        assert.equal(merged.text, `${ PR_HEADER }\n\n${ L1 }🗑️ detain deleted branch **${ BRANCH }**`);
+        assert.ok(!merged.text.includes('`'), 'no code spans');
+    });
+
+    it('keeps the blank line when the header was split by the batch path', () => {
+        const prEnv = {
+            type: 'msg',
+            message: PR_HEADER,
+            extra: {
+                event_type: 'pull_request',
+                repo: REPO,
+                _commit_sha: `pr:${ REPO }:1292`,
+                dedup_key: `github:pr:${ REPO }:1292`,
+                data: { action: 'closed', pull_request: { number: 1292, head: { sha: '92a86e7' } } }
+            }
+        };
+        const r1 = mergeGithubTrackable(emptyRecent(), prEnv);
+        const r2 = mergeGithubTrackable(r1, deleteEnv());
+        assert.ok(r2.text.endsWith(`Final.\n\n${ L1 }🗑️ detain deleted branch **${ BRANCH }**`), r2.text);
+    });
+
+    it('a single-line header keeps its bullets directly underneath', () => {
+        const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
+        assert.ok(!r1.text.includes('\n\n'), r1.text);
+    });
+});

@@ -216,7 +216,7 @@ describe('attachPrContext', () => {
         };
         const result = await attachPrContext(env);
         assert.equal(result.rerouted, false);
-        assert.ok(env.message.includes('created tag `v1.2.3`'),
+        assert.ok(env.message.includes('created tag **v1.2.3**'),
             'tag creation still gets a message rewrite');
     });
 
@@ -240,6 +240,10 @@ describe('attachPrContext', () => {
         assert.ok(env.message.includes('deleted'));
         assert.ok(env.message.includes('some-stale-branch'),
             'still tells the user what was deleted');
+        // Standalone message: bold ref (not a code span) and the repo link,
+        // since no parent header names the repo.
+        assert.equal(env.message,
+            '🗑️ detain deleted branch **some-stale-branch** in [detain/sugarcraft](https://github.com/detain/sugarcraft).');
     });
 
     it('issue_comment on a PR (per html_url) routes to the PR trackable', async () => {
