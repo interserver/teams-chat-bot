@@ -760,7 +760,10 @@ function prIdentity(env) {
     if (!prNumber || !repo) return null;
     const action = data.action || 'unknown';
     const headSha = (data.pull_request?.head?.sha || '').slice(0, 7) || 'nosha';
-    return `pr:${ repo }:${ prNumber }:${ action }:${ headSha }`;
+    // Label events fire once per label on the same head sha; include the
+    // label so they don't overwrite each other's bullet.
+    const label = (action === 'labeled' || action === 'unlabeled') ? (data.label?.name || '') : '';
+    return `pr:${ repo }:${ prNumber }:${ action }:${ headSha }${ label ? `:${ label }` : '' }`;
 }
 
 /**
@@ -829,6 +832,13 @@ function condensedBulletText(env) {
         // title + branches + (✅ Merged.) state — so a closed-after-opened
         // bullet doesn't duplicate the full description body underneath
         // its own parent.
+        const prAction = data.action || '';
+        const prLabel = data.label?.name;
+        if ((prAction === 'labeled' || prAction === 'unlabeled') && prLabel) {
+            // The PR title/link is already in the header, so just name the label.
+            const who = data.sender?.login || 'someone';
+            return `🏷️ ${ who } ${ prAction === 'labeled' ? 'created' : 'removed' } label **${ prLabel }**`;
+        }
         const firstLine = String(env.message || '')
             .split('\n')
             .find(l => l.trim().length > 0);
