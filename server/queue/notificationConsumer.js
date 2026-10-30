@@ -589,6 +589,18 @@ function normalizeGithubDedup(it) {
         return;
     }
 
+    // issues events are grouped by issue number so labeled/closed/etc.
+    // nest under the original "opened" message (same key issue_comment uses).
+    if (eventType === 'issues') {
+        const issueNumber = data.issue?.number;
+        const repo = extra.repo;
+        if (issueNumber && repo) {
+            extra.dedup_key = `github:issue:${ repo }:${ issueNumber }`;
+            extra._commit_sha = `issue:${ repo }:${ issueNumber }`;
+        }
+        return;
+    }
+
     // release events have no commit SHA but use tag_name for dedup
     if (eventType === 'release') {
         const tagName = data.release?.tag_name;
@@ -704,6 +716,15 @@ function jobIdentity(env) {
         const id = data.comment?.id;
         return id ? `commit_comment:${ id }` : null;
     }
+    if (eventType === 'issues') {
+        // Each follow-up action (labeled, closed…) is its own bullet;
+        // re-delivery of the same action+label overwrites in place.
+        const num = data.issue?.number;
+        if (!num || !extra.repo) return null;
+        const action = data.action || 'unknown';
+        const label = data.label?.name || data.assignee?.login || '';
+        return `issue:${ extra.repo }:${ num }:${ action }:${ label }`;
+    }
     if (eventType === 'pull_request') {
         // PRs use prIdentity for grouping - each PR action (opened, closed,
         // synchronize, etc.) is a distinct event that should be a sub-bullet
@@ -812,6 +833,21 @@ function condensedBulletText(env) {
             .split('\n')
             .find(l => l.trim().length > 0);
         return firstLine ? firstLine.trim() : null;
+    }
+    if (eventType === 'issues') {
+        // Only follow-up actions are condensed; `opened` keeps the verbose
+        // message so the header still carries title/description/repo.
+        const action = data.action || '';
+        if (!action || action === 'opened') return null;
+        const sender = data.sender?.login || 'someone';
+        const labelName = data.label?.name;
+        if ((action === 'labeled' || action === 'unlabeled') && labelName) {
+            return `🏷️ ${ sender } ${ action } issue **${ labelName }**`;
+        }
+        if ((action === 'assigned' || action === 'unassigned') && data.assignee?.login) {
+            return `👤 ${ sender } ${ action } issue ${ action === 'assigned' ? 'to' : 'from' } **${ data.assignee.login }**`;
+        }
+        return `ℹ️ ${ sender } ${ action } issue`;
     }
     if (eventType === 'create' || eventType === 'delete') {
         // Branch create/delete nests under its PR's trackable, whose header
