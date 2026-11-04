@@ -843,6 +843,10 @@ describe('collapseCommitBullets', () => {
     it('returns null when nothing extracts', () => {
         assert.equal(collapseCommitBullets([{ identity: null, text: 'no links here' }]), null);
     });
+    it('ignores prose bullets that merely quote a commit link', () => {
+        const line = collapseCommitBullets(['see [a1b2c3d](https://example/x) inline', commitItem(0)]);
+        assert.equal(line, '- Commits: [0000001](https://github.com/o/r/commit/0000001)');
+    });
 });
 
 describe('renderTrackable — commit collapse', () => {
@@ -892,6 +896,16 @@ describe('renderTrackable — commit collapse', () => {
         assert.ok(lines[2].startsWith('- Commits: [0000001]'), lines[2].slice(0, 60));
         assert.ok(lines[2].includes('[0000002]'), 'both commit links share one collapsed line');
         assert.ok(lines[3].startsWith('- ℹ️ note between commits'), lines[3]);
+    });
+
+    it('does not swallow prose bullets containing inline commit links', () => {
+        const items = Array.from({ length: 20 }, (_, i) => commitItem(i));
+        items.splice(3, 0, { identity: null, text: 'Refs [0000099](https://github.com/o/r/commit/0000099) for context' });
+        const out = renderTrackable('hdr', items);
+        assert.ok(out.includes('- Refs [0000099](https://github.com/o/r/commit/0000099) for context'), 'prose bullet keeps its own line and text');
+        const collapsed = out.split('\n').find(l => l.startsWith('- Commits: '));
+        assert.equal((collapsed.match(/\[00000/g) || []).length, 20, 'only the 20 commit links collapse');
+        assert.ok(!collapsed.includes('0000099'), 'quoted prose link is not absorbed');
     });
 
     it('honors NOTIF_COMMIT_COLLAPSE_COUNT via environment (child process)', () => {

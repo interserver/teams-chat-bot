@@ -428,6 +428,17 @@ const RELEASE_ACTION_WORDS = {
 };
 
 /**
+ * Display verb for a release action. Own-property lookup only: a forged or
+ * buggy `action` like "constructor" must never stringify an inherited
+ * prototype member into the message. Unknown actions pass through verbatim.
+ */
+function releaseActionVerb(action) {
+    const word = String(action || '').trim();
+    if (Object.hasOwn(RELEASE_ACTION_WORDS, word)) return RELEASE_ACTION_WORDS[word];
+    return word || 'updated';
+}
+
+/**
  * Strip markdown control characters from a release name/tag and cap it, so
  * payload text can never unbalance the surrounding `**bold**` / `[link](url)`
  * syntax. Returns '' for nothing renderable.
@@ -435,7 +446,7 @@ const RELEASE_ACTION_WORDS = {
 function sanitizeReleaseTitle(value) {
     const cleaned = String(value ?? '')
         .replace(/[[\]()*~_+`\\]/g, '')
-        .replace(/\s+/g, ' ')
+        .replace(/\s+/, ' ')
         .trim();
     if (!cleaned) return '';
     const capped = charCut(cleaned, 80);
@@ -463,19 +474,23 @@ function describeReleaseEvent(data, repo) {
     const name = sanitizeReleaseTitle(rawName);
     const showTagNote = Boolean(name) && rawName !== rawTag;
 
+    const action = String(data.action || '').trim();
+    const verb = releaseActionVerb(action);
+    // A deleted release has no live page: 🗑️ and no (404-ing) tag link.
+    const isDeleted = action.toLowerCase() === 'deleted';
+
+    // Only an https URL without spaces/parens can ride inside the markdown
+    // link safely; anything else falls through to the constructed tag URL.
     const htmlUrl = String(release.html_url || '').trim();
     let url = '';
-    if (/^https:\/\//i.test(htmlUrl)) url = htmlUrl;
-    else if (repo) url = `https://github.com/${ repo }/releases/tag/${ encodeURIComponent(rawTag) }`;
-    else if (htmlUrl) url = htmlUrl;
+    if (/^https:\/\/[^()\s]+$/i.test(htmlUrl)) url = htmlUrl;
+    else if (repo && !isDeleted) url = `https://github.com/${ repo }/releases/tag/${ encodeURIComponent(rawTag) }`;
 
     const title = showTagNote ? name : tag;
-    const linked = url ? `[**${ title }**](${ url })` : `**${ title }**`;
+    const linked = (url && !isDeleted) ? `[**${ title }**](${ url })` : `**${ title }**`;
     const tagNote = showTagNote ? ` — ${ tag }` : '';
-    const emoji = release.prerelease ? '🧪' : '🚀';
+    const emoji = isDeleted ? '🗑️' : (release.prerelease ? '🧪' : '🚀');
     const preNote = release.prerelease ? ' _(pre-release)_' : '';
-    const action = String(data.action || '').trim();
-    const verb = RELEASE_ACTION_WORDS[action] || action || 'updated';
     const repoTail = repo ? ` on [${ repo }](https://github.com/${ repo }).` : '';
     return `${ emoji } ${ verb } ${ linked }${ tagNote }${ preNote }${ repoTail }`;
 }
@@ -960,8 +975,8 @@ function condensedBulletText(env) {
         const rawName = String(release.name || '').trim();
         const name = sanitizeReleaseTitle(rawName);
         const action = String(data.action || '').trim();
-        const verb = RELEASE_ACTION_WORDS[action] || action || 'updated';
-        const emoji = release.prerelease ? '🧪' : '🚀';
+        const verb = releaseActionVerb(action);
+        const emoji = action.toLowerCase() === 'deleted' ? '🗑️' : (release.prerelease ? '🧪' : '🚀');
         const title = name && rawName !== rawTag ? `**${ name }** (${ tag })` : `**${ tag }**`;
         return `${ emoji } ${ title } — ${ verb }`;
     }
@@ -1254,6 +1269,8 @@ function emitLeafBucket(lines, level, leaves) {
  *   • [4fd48e4](https://github.com/owner/repo/commit/4fd48e4…) _msg_ (~1 files)
  * COMMIT_LINK_PREFIX_RE anchors at the text start (generous label) for
  * detection; COMMIT_LINK_RE requires a hex label anywhere for extraction.
+ * Collapse always gates on isCommitBullet first, so a prose bullet that
+ * merely quotes a commit link keeps its own line and its full text.
  */
 const COMMIT_LINK_PREFIX_RE = /^\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/i;
 const COMMIT_LINK_RE = /\[([0-9a-f]{7,40})\]\((https?:\/\/[^)\s]+)\)/i;
@@ -1272,19 +1289,32 @@ function isCommitBullet(itemText) {
 }
 
 /**
- * Collapse commit bullets into one `- Commits: [sha7](url), …` line. Every
- * link is kept (labels shortened to 7 chars); the per-commit message and
- * file-count annotations are sacrificed so the trackable stays under Teams'
- * activity cap instead of losing the newest commits to tail truncation.
- * Returns null when no item carries an extractable commit link.
+ * Collapsed `[sha7](url)` form of an item's first extractable commit link,
+ * or null when the text carries none. Shared by both collapse paths so
+ * detection (isCommitBullet) and extraction can never drift apart.
+ */
+function commitLinkOf(itemText) {
+    const m = String(itemText || '').match(COMMIT_LINK_RE);
+    if (!m) return null;
+    return `[${ m[1].slice(0, 7) }](${ m[2] })`;
+}
+
+/**
+ * Collapse an Array of commit bullets into one `- Commits: [sha7](url), …`
+ * line. Every link is kept (labels shortened to 7 chars); the per-commit
+ * message and file-count annotations are sacrificed so the trackable stays
+ * under Teams' activity cap instead of losing the newest commits to tail
+ * truncation. Non-commit bullets and links that fail extraction are ignored.
+ * Returns null when nothing collapses.
+ * @param {Array} items trackable item records ({ text }) or bare strings
  */
 function collapseCommitBullets(items) {
     const links = [];
     for (const item of items) {
         const text = typeof item === 'string' ? item : (item && item.text) || '';
-        const m = text.match(COMMIT_LINK_RE);
-        if (!m) continue;
-        links.push(`[${ m[1].slice(0, 7) }](${ m[2] })`);
+        if (!isCommitBullet(text)) continue;
+        const link = commitLinkOf(text);
+        if (link) links.push(link);
     }
     if (links.length === 0) return null;
     return bulletPrefix(1) + `Commits: ${ links.join(', ') }`;
@@ -1302,6 +1332,8 @@ function collapseCommitBullets(items) {
  * guardActivity tail-truncated and silently dropped the newest commits).
  * If even the collapsed form is too big, guardActivity's truncation stays
  * as the backstop.
+ * @param {string} header trackable header line
+ * @param {object} items item records rendered by renderTrackableBody
  */
 function renderTrackable(header, items) {
     const commitCount = items.reduce((acc, it) => acc + (isCommitBullet(it && it.text) ? 1 : 0), 0);
@@ -1313,11 +1345,18 @@ function renderTrackable(header, items) {
     return expanded;
 }
 
+/**
+ * Render a trackable's header, flat bullets (in insertion order), the
+ * optionally collapsed `- Commits:` line, and the grouped check_run tree.
+ * @param {string} header trackable header line
+ * @param {Array} items item records ({ text, identity })
+ * @param {boolean} collapseCommits absorb commit bullets into one line
+ */
 function renderTrackableBody(header, items, collapseCommits) {
     const headerText = String(header || '').trim();
     const flatBullets = [];
     const checkItems = [];
-    const commitLinks = [];
+    const commitItems = [];
     let commitSlot = null; // flatBullets index where the collapsed line belongs
 
     for (const item of items) {
@@ -1338,20 +1377,21 @@ function renderTrackableBody(header, items, collapseCommits) {
                 continue;
             }
         }
-        if (collapseCommits) {
-            const linkMatch = String(item.text || '').match(COMMIT_LINK_RE);
-            if (linkMatch) {
-                if (commitSlot === null) commitSlot = flatBullets.length;
-                commitLinks.push(`[${ linkMatch[1].slice(0, 7) }](${ linkMatch[2] })`);
-                continue;
-            }
+        // Strict gate: only genuine commit bullets (leading commit link)
+        // with an extractable hex link are absorbed — prose bullets that
+        // merely quote a commit link keep their own line and full text.
+        if (collapseCommits && isCommitBullet(item.text) && commitLinkOf(item.text)) {
+            if (commitSlot === null) commitSlot = flatBullets.length;
+            commitItems.push(item);
+            continue;
         }
         const bullet = indentAsBullet(item.text);
         if (bullet) flatBullets.push(bullet);
     }
 
-    if (commitLinks.length > 0) {
-        flatBullets.splice(commitSlot, 0, bulletPrefix(1) + `Commits: ${ commitLinks.join(', ') }`);
+    if (commitItems.length > 0) {
+        // Every absorbed item passed gate + extraction, so this never nulls.
+        flatBullets.splice(commitSlot, 0, collapseCommitBullets(commitItems));
     }
 
     const lines = [];

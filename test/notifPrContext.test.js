@@ -405,6 +405,27 @@ describe('describeReleaseEvent', () => {
         assert.ok(!line.includes('x'.repeat(81)), 'name capped at 80 chars');
     });
 
+    it('renders deleted releases with the waste-basket and no dead link', () => {
+        const line = describeReleaseEvent({
+            action: 'deleted',
+            release: { tag_name: 'v1.2.3', html_url: 'https://github.com/detain/sugarcraft/releases/tag/v1.2.3' }
+        }, 'detain/sugarcraft');
+        assert.equal(line, '🗑️ deleted **v1.2.3** on [detain/sugarcraft](https://github.com/detain/sugarcraft).');
+    });
+
+    it('never leaks prototype members through forged actions', () => {
+        const line = describeReleaseEvent({ action: 'constructor', release: { tag_name: 'v1' } }, 'o/r');
+        assert.ok(line.includes('constructor'), line);
+        assert.ok(!line.includes('[native code]'), line);
+    });
+
+    it('falls back to the constructed tag URL for unsafe html_url values', () => {
+        const js = describeReleaseEvent({ action: 'published', release: { tag_name: 'v1', html_url: 'javascript:alert(1)' } }, 'o/r');
+        assert.ok(js.includes('](https://github.com/o/r/releases/tag/v1)'), js);
+        const spaced = describeReleaseEvent({ action: 'published', release: { tag_name: 'v1', html_url: 'https://example.com/a b' } }, 'o/r');
+        assert.ok(spaced.includes('](https://github.com/o/r/releases/tag/v1)'), spaced);
+    });
+
     it('returns null without a tag_name or with stripped data', () => {
         assert.equal(describeReleaseEvent({ release: {} }, 'o/r'), null);
         assert.equal(describeReleaseEvent({ release: { tag_name: '   ' } }, 'o/r'), null);
@@ -488,6 +509,13 @@ describe('condensedBulletText — release branch', () => {
             extra: { event_type: 'release', data: { action: 'published', release: { tag_name: 'v9.9.9' } } }
         });
         assert.equal(bullet, '🚀 **v9.9.9** — published');
+    });
+
+    it('marks a deleted release with the waste-basket', () => {
+        const bullet = condensedBulletText({
+            extra: { event_type: 'release', data: { action: 'deleted', release: { tag_name: 'v9.9.9' } } }
+        });
+        assert.equal(bullet, '🗑️ **v9.9.9** — deleted');
     });
 
     it('returns null for stripped or tagless data', () => {
