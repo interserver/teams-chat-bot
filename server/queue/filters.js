@@ -60,6 +60,22 @@ function shouldSkip(envelope) {
         if (eventType === 'workflow_run') {
             return '__SILENT__'; // aggregate — individual workflow_job events carry the detail
         }
+        if (eventType === 'registry_package' || eventType === 'package') {
+            // One container push fires a publish event per manifest: the
+            // tagged image index (`latest`, `<sha>`) plus several untagged
+            // per-platform manifests / attestations whose only identity is a
+            // sha256 digest. Those untagged ones never say anything the
+            // tagged event doesn't. Drop only when the producer explicitly
+            // sent an empty tag — envelopes without container_metadata
+            // (non-container packages, older producer) pass through.
+            const pkg = data.registry_package || data.package;
+            const tagMeta = pkg && pkg.package_version && pkg.package_version.container_metadata
+                && pkg.package_version.container_metadata.tag;
+            if (tagMeta && typeof tagMeta === 'object' && !String(tagMeta.name || '').trim()) {
+                return '__SILENT__';
+            }
+            return null;
+        }
         if (LOW_SIGNAL_GITHUB_EVENTS.has(eventType)) {
             return `low-signal github event ${ eventType }`;
         }

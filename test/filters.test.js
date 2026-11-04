@@ -38,3 +38,39 @@ describe('shouldSkip — unexpanded `${{ matrix.* }}` placeholders', () => {
         assert.equal(shouldSkip(checkRunEnv('matrix sanity test', 'success')), null);
     });
 });
+
+describe('shouldSkip — untagged container package versions', () => {
+    function pkgEnv(eventType, packageVersion) {
+        return {
+            extra: {
+                event_type: eventType,
+                data: {
+                    action: 'published',
+                    registry_package: { name: 'phlix-hub', package_type: 'CONTAINER', package_version: packageVersion }
+                }
+            }
+        };
+    }
+    const DIGEST = 'sha256:ef7e3ab209e9b8bc65b5d57e13fa9ea929206ed323c68cf62bd8b6da122cc229';
+
+    it('silently drops a container version whose tag name is empty', () => {
+        const env = pkgEnv('registry_package', { name: DIGEST, container_metadata: { tag: { name: '', digest: DIGEST } } });
+        assert.equal(shouldSkip(env), '__SILENT__');
+    });
+    it('drops a whitespace-only tag under the legacy package event too', () => {
+        const env = pkgEnv('package', { name: DIGEST, container_metadata: { tag: { name: '  ' } } });
+        env.extra.data.package = env.extra.data.registry_package;
+        delete env.extra.data.registry_package;
+        assert.equal(shouldSkip(env), '__SILENT__');
+    });
+    it('passes a tagged container version through', () => {
+        const env = pkgEnv('registry_package', { name: DIGEST, container_metadata: { tag: { name: 'latest', digest: DIGEST } } });
+        assert.equal(shouldSkip(env), null);
+    });
+    it('passes through when container_metadata is absent (older producer, npm, stripped data)', () => {
+        assert.equal(shouldSkip(pkgEnv('registry_package', { name: DIGEST })), null);
+        assert.equal(shouldSkip(pkgEnv('registry_package', { name: '2.1.0' })), null);
+        assert.equal(shouldSkip({ extra: { event_type: 'registry_package', data: { __stripped: true } } }), null);
+        assert.equal(shouldSkip({ extra: { event_type: 'registry_package', data: {} } }), null);
+    });
+});

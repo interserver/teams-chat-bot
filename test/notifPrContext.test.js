@@ -717,10 +717,230 @@ describe('attachPrContext — package stub rewrite', () => {
     });
 });
 
+describe('container package labels + links', () => {
+    const { describePackageEvent, packageLabel, packageUrl, condensedBulletText } = consumer;
+    const DIGEST = 'sha256:00fdf23e8ee8fcfcf056c62aaab61030b68e2c8036fe3192276a98a6badde8d6';
+    // Shape of a real ghcr.io publish delivery (detain/phlix-server, trimmed).
+    function containerPkg(tag, extra = {}) {
+        return {
+            id: 12329883,
+            name: 'phlix-hub',
+            package_type: 'CONTAINER',
+            html_url: 'https://github.com/detain/packages/12329883',
+            package_version: {
+                id: 1499622292,
+                name: DIGEST,
+                version: DIGEST,
+                html_url: 'https://github.com/users/detain/packages/container/phlix-hub/1499622292',
+                container_metadata: { tag: { name: tag, digest: DIGEST } },
+                ...extra
+            }
+        };
+    }
+
+    it('labels a tagged container as name:tag', () => {
+        assert.equal(packageLabel(containerPkg('latest')), 'phlix-hub:latest');
+        assert.equal(packageLabel(containerPkg('7fb50998030b')), 'phlix-hub:7fb50998030b');
+    });
+
+    it('shortens a digest-only version to a 12-hex id', () => {
+        assert.equal(packageLabel(containerPkg('')), 'phlix-hub@sha256:00fdf23e8ee8');
+        // Older producer: no container_metadata, digest as version name.
+        assert.equal(packageLabel({ name: 'phlix-hub', package_type: 'CONTAINER', package_version: { name: DIGEST } }),
+            'phlix-hub@sha256:00fdf23e8ee8');
+    });
+
+    it('leaves non-container versions alone', () => {
+        assert.equal(packageLabel({ name: '@detain/sugarcraft', package_type: 'npm', package_version: { name: '2.1.0' } }),
+            '@detain/sugarcraft@2.1.0');
+        assert.equal(packageLabel({ name: 'bare' }), 'bare');
+        assert.equal(packageLabel({ name: '' }), '');
+        assert.equal(packageLabel(null), '');
+    });
+
+    it('prefers the per-version html_url over the 404ing package html_url', () => {
+        assert.equal(packageUrl(containerPkg('latest'), 'detain/phlix-server'),
+            'https://github.com/users/detain/packages/container/phlix-hub/1499622292');
+    });
+
+    it('skips the known-broken /{owner}/packages/{id} url and falls back to the repo packages tab', () => {
+        const pkg = { name: 'phlix-hub', html_url: 'https://github.com/detain/packages/12329883' };
+        assert.equal(packageUrl(pkg, 'detain/phlix-server'), 'https://github.com/detain/phlix-server/packages');
+    });
+
+    it('keeps a working package-level html_url', () => {
+        const pkg = { name: 'p', html_url: 'https://github.com/detain/sugarcraft/packages/8123456' };
+        assert.equal(packageUrl(pkg, 'o/r'), 'https://github.com/detain/sugarcraft/packages/8123456');
+    });
+
+    it('rejects an unsafe per-version html_url', () => {
+        const pkg = { name: 'p', package_version: { html_url: 'javascript:alert(1)' } };
+        assert.equal(packageUrl(pkg, 'o/r'), 'https://github.com/o/r/packages');
+    });
+
+    it('describes a tagged container publish with tag + working link', () => {
+        const line = describePackageEvent({ action: 'published', registry_package: containerPkg('latest') }, 'detain/phlix-server');
+        assert.equal(line, '📦 published [**phlix-hub:latest**](https://github.com/users/detain/packages/container/phlix-hub/1499622292) (container) on [detain/phlix-server](https://github.com/detain/phlix-server).');
+    });
+
+    it('condenses a folded container bullet to name:tag', () => {
+        const bullet = condensedBulletText({
+            extra: { event_type: 'registry_package', data: { action: 'published', registry_package: containerPkg('latest') } }
+        });
+        assert.equal(bullet, '📦 [**phlix-hub:latest**](https://github.com/users/detain/packages/container/phlix-hub/1499622292) — published');
+    });
+});
+
+describe('attachPackageCommit — nest SHA-tagged images under their commit', () => {
+    const { attachPackageCommit, collectTickPackageShas, commitShaFromTag, pkgDigestKey, jobIdentity, mergeGithubTrackable } = consumer;
+    const DIGEST = 'sha256:243f1c8ce7b2aa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233';
+    const ROOM = 'int-dev-announce';
+    let originals;
+    let redisMock;
+
+    function pkgEnv(tag, { digest = DIGEST, room = ROOM, action = 'published' } = {}) {
+        return {
+            type: 'msg',
+            room,
+            message: `📦 github-actions[bot] ${ action } container package phlix-hub on detain/phlix-server.`,
+            extra: {
+                event_type: 'registry_package',
+                repo: 'detain/phlix-server',
+                dedup_key: `github:package:detain/phlix-server:phlix-hub:${ digest }`,
+                _commit_sha: `package:detain/phlix-server:phlix-hub:${ digest }`,
+                data: {
+                    action,
+                    registry_package: {
+                        name: 'phlix-hub',
+                        package_type: 'CONTAINER',
+                        package_version: {
+                            name: digest,
+                            html_url: 'https://github.com/users/detain/packages/container/phlix-hub/1499627176',
+                            container_metadata: { tag: { name: tag, digest } }
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    function seedCommitTrackable(sha7, { room = ROOM, ageMs = 60_000 } = {}) {
+        redisMock._hashes.set(`notif:recent:${ room }`, new Map([[
+            `github:commit:${ sha7 }`,
+            JSON.stringify({ activityId: 'act-1', ts: Date.now() - ageMs, type: 'msg' })
+        ]]));
+    }
+
+    before(() => {
+        redisMock = makeRedisMock();
+        redisMock._hashes = new Map();
+        redisMock.hget = async (key, field) => redisMock._hashes.get(key)?.get(field) ?? null;
+        originals = _setInternalsForTest({ redis: redisMock });
+    });
+    after(() => {
+        _setInternalsForTest(originals || {});
+    });
+    beforeEach(() => {
+        redisMock._kv.clear();
+        redisMock._hashes.clear();
+    });
+
+    it('treats only 7–40 hex tags as commit SHAs', () => {
+        assert.equal(commitShaFromTag('f2c9cc915d8b'), 'f2c9cc9');
+        assert.equal(commitShaFromTag('F2C9CC915D8B'), 'f2c9cc9');
+        assert.equal(commitShaFromTag('latest'), null);
+        assert.equal(commitShaFromTag('buildcache'), null);
+        assert.equal(commitShaFromTag('abc123'), null);
+        assert.equal(commitShaFromTag('v1.2.3'), null);
+        assert.equal(commitShaFromTag(''), null);
+    });
+
+    it('re-keys a SHA-tagged publish onto the live commit trackable', async () => {
+        seedCommitTrackable('f2c9cc9');
+        const env = pkgEnv('f2c9cc915d8b');
+        const result = await attachPackageCommit(env);
+        assert.equal(result.attached, true);
+        assert.equal(result.source, 'tag');
+        assert.equal(env.extra.dedup_key, 'github:commit:f2c9cc9');
+        assert.equal(env.extra._commit_sha, 'f2c9cc9');
+        assert.equal(env.extra._original_dedup_key, `github:package:detain/phlix-server:phlix-hub:${ DIGEST }`);
+        // Digest index seeded for the `latest` tag that may follow.
+        assert.equal(await redisMock.get(pkgDigestKey('phlix-hub', DIGEST)), 'f2c9cc9');
+    });
+
+    it('follows the digest index for a `latest` tag drained in a later tick', async () => {
+        seedCommitTrackable('f2c9cc9');
+        await attachPackageCommit(pkgEnv('f2c9cc915d8b'));
+        const latest = pkgEnv('latest');
+        const result = await attachPackageCommit(latest);
+        assert.equal(result.attached, true);
+        assert.equal(result.source, 'digest_index');
+        assert.equal(latest.extra.dedup_key, 'github:commit:f2c9cc9');
+    });
+
+    it('resolves `latest` from the same tick even when it is drained first', async () => {
+        seedCommitTrackable('f2c9cc9');
+        const latest = pkgEnv('latest');
+        const shaTagged = pkgEnv('f2c9cc915d8b');
+        const tickShas = collectTickPackageShas([{ env: latest }, { env: shaTagged }]);
+        const result = await attachPackageCommit(latest, tickShas);
+        assert.equal(result.attached, true);
+        assert.equal(result.source, 'tick_digest');
+        assert.equal(latest.extra.dedup_key, 'github:commit:f2c9cc9');
+    });
+
+    it('keeps its own trackable when no commit trackable is live in the room', async () => {
+        const env = pkgEnv('f2c9cc915d8b');
+        const result = await attachPackageCommit(env);
+        assert.equal(result.attached, false);
+        assert.equal(result.reason, 'no_live_commit_trackable');
+        assert.equal(env.extra.dedup_key, `github:package:detain/phlix-server:phlix-hub:${ DIGEST }`);
+    });
+
+    it('does not nest under a commit trackable in a different room or past the edit window', async () => {
+        seedCommitTrackable('f2c9cc9', { room: 'notifications' });
+        assert.equal((await attachPackageCommit(pkgEnv('f2c9cc915d8b'))).attached, false);
+        seedCommitTrackable('f2c9cc9', { ageMs: 2 * 60 * 60 * 1000 });
+        assert.equal((await attachPackageCommit(pkgEnv('f2c9cc915d8b'))).attached, false);
+    });
+
+    it('leaves non-SHA tags without a digest match alone', async () => {
+        seedCommitTrackable('f2c9cc9');
+        const env = pkgEnv('latest');
+        const result = await attachPackageCommit(env);
+        assert.equal(result.attached, false);
+        assert.equal(result.reason, 'no_commit_tag');
+    });
+
+    it('ignores non-package events and stripped payloads', async () => {
+        assert.deepEqual(await attachPackageCommit({ extra: { event_type: 'push', data: {} } }), { attached: false });
+        assert.deepEqual(await attachPackageCommit({ extra: { event_type: 'registry_package', data: { __stripped: true } } }), { attached: false });
+    });
+
+    it('gives each image reference + action its own bullet identity', () => {
+        assert.equal(jobIdentity(pkgEnv('f2c9cc915d8b')), 'package:phlix-hub:f2c9cc915d8b:published');
+        assert.equal(jobIdentity(pkgEnv('latest')), 'package:phlix-hub:latest:published');
+        assert.equal(jobIdentity({ extra: { event_type: 'registry_package', data: { __stripped: true } } }), null);
+    });
+
+    it('renders as nested bullets under the commit header, re-delivery updates in place', () => {
+        const commit = { header: '📦 Joe pushed 1 commit to detain/phlix-hub master', items: [], header_identity: null };
+        const shaTagged = pkgEnv('f2c9cc915d8b');
+        const step1 = mergeGithubTrackable(commit, shaTagged);
+        const step2 = mergeGithubTrackable(step1, pkgEnv('latest'));
+        const step3 = mergeGithubTrackable(step2, shaTagged);
+        assert.equal(step3.header, commit.header);
+        assert.equal(step3.items.length, 2);
+        assert.ok(step3.items[0].text.includes('**phlix-hub:f2c9cc915d8b**'), step3.items[0].text);
+        assert.ok(step3.items[1].text.includes('**phlix-hub:latest**'), step3.items[1].text);
+        assert.ok(step3.text.includes('/users/detain/packages/container/phlix-hub/1499627176'), step3.text);
+    });
+});
+
 describe('condensedBulletText — package branch', () => {
     const { condensedBulletText } = consumer;
 
-    it('condenses a package event to emoji + name@version + verb', () => {
+    it('condenses a package event to emoji + linked name@version + verb', () => {
         const bullet = condensedBulletText({
             extra: {
                 event_type: 'registry_package',
@@ -735,7 +955,7 @@ describe('condensedBulletText — package branch', () => {
                 }
             }
         });
-        assert.equal(bullet, '📦 **@detain/sugarcraft@2.1.0** — published');
+        assert.equal(bullet, '📦 [**@detain/sugarcraft@2.1.0**](https://github.com/detain/sugarcraft/packages) — published');
     });
 
     it('renders bare name when no version, under the legacy event_type', () => {

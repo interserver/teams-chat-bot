@@ -136,6 +136,10 @@ function metric(name) { return k('metrics:') + name; }
 // so subsequent `push` and `delete` events on the same branch can be
 // rerouted into the PR's trackable instead of spawning their own messages.
 function prBranchKey(repo, branch) { return k('prbranch:') + repo + ':' + branch; }
+// Container digest → commit sha7 index (`notif:pkgdigest:{name}:{digest}`),
+// seeded by SHA-tagged image publishes so the `latest` tag of the same
+// digest can find the commit it was built from. TTL = EDIT_WINDOW_MS.
+function pkgDigestKey(name, digest) { return k('pkgdigest:') + name + ':' + digest; }
 
 // ---------------------------------------------------------------------------
 // Action-triggered push attribution
@@ -525,9 +529,61 @@ const PACKAGE_TYPE_LABELS = {
     nuget: 'nuget',
     docker: 'docker',
     container_registry: 'container',
+    container: 'container',
     hex: 'hex',
     actions: 'actions'
 };
+
+// package_type values that publish to a container registry (ghcr.io). The
+// webhook sends `CONTAINER`; `docker`/`container_registry` are the legacy
+// GitHub Packages names.
+const CONTAINER_PACKAGE_TYPES = new Set(['container', 'docker', 'container_registry']);
+
+// GitHub's top-level `registry_package.html_url` for user-owned container
+// packages is `https://github.com/{owner}/packages/{id}`, which 404s. The
+// per-version `package_version.html_url` is the link that actually works.
+const BROKEN_PACKAGE_URL_RE = /^https:\/\/github\.com\/[^/]+\/packages\/\d+\/?$/i;
+
+/**
+ * Human label for a package version, sanitized for markdown:
+ *   - container with a tag → `phlix-hub:latest` (docker image reference)
+ *   - digest-only version  → `phlix-hub@sha256:00fdf23e8ee8` (12-hex short id)
+ *   - anything else        → `@detain/sugarcraft@2.1.0`, or the bare name
+ * Returns '' when the package has no usable name.
+ */
+function packageLabel(pkg) {
+    const name = sanitizeReleaseTitle(pkg?.name);
+    if (!name) return '';
+    const pv = pkg.package_version || {};
+    const rawType = String(pkg.package_type || '').trim().toLowerCase();
+    const tagMeta = pv.container_metadata?.tag;
+    const isContainer = CONTAINER_PACKAGE_TYPES.has(rawType) || Boolean(tagMeta);
+    const tag = sanitizeReleaseTitle(String(tagMeta?.name ?? '').trim(), 40);
+    if (isContainer && tag) return `${ name }:${ tag }`;
+
+    const rawVersion = String(pv.name ?? pv.version ?? pkg.version ?? '').trim();
+    const digest = /^sha256:([0-9a-f]{12})[0-9a-f]*$/i.exec(rawVersion);
+    const version = digest ? `sha256:${ digest[1].toLowerCase() }` : sanitizeReleaseTitle(rawVersion, 40);
+    return version ? `${ name }@${ version }` : name;
+}
+
+/**
+ * Best working link for a package event: the per-version page, then the
+ * package page (unless it is GitHub's known-404 `/{owner}/packages/{id}`
+ * shape), then the repo's packages tab. Only https URLs without spaces or
+ * parens can ride inside a markdown link safely.
+ */
+function packageUrl(pkg, repo) {
+    const safe = (value) => {
+        const url = String(value || '').trim();
+        return /^https:\/\/[^()\s]+$/i.test(url) ? url : '';
+    };
+    const versionUrl = safe(pkg?.package_version?.html_url);
+    if (versionUrl) return versionUrl;
+    const pkgUrl = safe(pkg?.html_url);
+    if (pkgUrl && !BROKEN_PACKAGE_URL_RE.test(pkgUrl)) return pkgUrl;
+    return repo ? `https://github.com/${ repo }/packages` : '';
+}
 
 /**
  * Build the descriptive one-line message for a GitHub `package` /
@@ -539,6 +595,7 @@ const PACKAGE_TYPE_LABELS = {
  * name. Format:
  *
  *   📦 published [**@detain/sugarcraft@2.1.0**](https://github.com/orgs/...) (npm) on [detain/sugarcraft](https://github.com/detain/sugarcraft).
+ *   📦 published [**phlix-hub:latest**](https://github.com/users/...) (container) on [detain/phlix-server](...).
  *
  * The `(type)` note rides AFTER the link on purpose — parentheses inside a
  * markdown link label break the parser (same law as release tag notes).
@@ -547,14 +604,8 @@ function describePackageEvent(data, repo) {
     if (!data || data.__stripped) return null;
     const pkg = data.registry_package ?? data.package;
     if (!pkg) return null;
-    const name = sanitizeReleaseTitle(pkg.name);
-    if (!name) return null;
-
-    const rawVersion = String(
-        pkg.package_version?.name ?? pkg.package_version?.version ?? pkg.version ?? ''
-    ).trim();
-    const version = sanitizeReleaseTitle(rawVersion, 40);
-    const label = version ? `${ name }@${ version }` : name;
+    const label = packageLabel(pkg);
+    if (!label) return null;
 
     const action = String(data.action || '').trim();
     const verb = packageActionVerb(action);
@@ -565,17 +616,126 @@ function describePackageEvent(data, repo) {
         typeLabel = Object.hasOwn(PACKAGE_TYPE_LABELS, rawType) ? PACKAGE_TYPE_LABELS[rawType] : rawType;
     }
 
-    // Only an https URL without spaces/parens can ride inside the markdown
-    // link safely; anything else falls through to the repo packages page.
-    const htmlUrl = String(pkg.html_url || '').trim();
-    let url = '';
-    if (/^https:\/\/[^()\s]+$/i.test(htmlUrl)) url = htmlUrl;
-    else if (repo) url = `https://github.com/${ repo }/packages`;
-
+    const url = packageUrl(pkg, repo);
     const linked = url ? `[**${ label }**](${ url })` : `**${ label }**`;
     const typeNote = typeLabel ? ` (${ typeLabel })` : '';
     const repoTail = repo ? ` on [${ repo }](https://github.com/${ repo }).` : '';
     return `📦 ${ verb } ${ linked }${ typeNote }${ repoTail }`;
+}
+
+// ---------------------------------------------------------------------------
+// Container package → commit attribution
+// ---------------------------------------------------------------------------
+//
+// A CI "Docker Image" workflow tags each image it pushes with the commit SHA
+// it built (`phlix-hub:f2c9cc915d8b`) plus floating tags (`latest`) on the
+// same digest. GitHub files the `registry_package` event under whichever
+// repo the image's source label names — not necessarily the repo whose
+// commit built it — and its `target_oid` is just that repo's HEAD, so it
+// cannot be used for linking. The SHA-shaped tag can: when a live
+// `github:commit:{sha7}` trackable exists in the same room, the publish is
+// re-keyed onto it and renders as a nested bullet under the commit.
+
+const COMMIT_TAG_RE = /^[0-9a-f]{7,40}$/i;
+
+/**
+ * Pull `{ name, tag, digest }` out of a container package envelope, or null
+ * for non-package events, stripped payloads, and packages without a name.
+ * `digest` falls back to the version name, which ghcr sets to the digest.
+ */
+function containerPackageRef(env) {
+    const extra = env.extra || {};
+    const eventType = extra.event_type || '';
+    if (eventType !== 'registry_package' && eventType !== 'package') return null;
+    const data = extra.data || {};
+    if (data.__stripped) return null;
+    const pkg = data.registry_package ?? data.package;
+    const name = String(pkg?.name || '').trim();
+    if (!name) return null;
+    const pv = pkg.package_version || {};
+    const tagMeta = pv.container_metadata?.tag || {};
+    const tag = String(tagMeta.name || '').trim();
+    const rawDigest = String(tagMeta.digest || pv.name || '').trim();
+    const digest = /^sha256:[0-9a-f]{12,}$/i.test(rawDigest) ? rawDigest.toLowerCase() : '';
+    return { name, tag, digest };
+}
+
+/** sha7 when the tag looks like a commit SHA, else null. */
+function commitShaFromTag(tag) {
+    return COMMIT_TAG_RE.test(tag || '') ? tag.slice(0, 7).toLowerCase() : null;
+}
+
+/**
+ * Pre-pass over one tick's drained items: digest → sha7 for every
+ * SHA-tagged container publish, so a `latest` event drained in the same
+ * tick (GitHub often delivers it first) can resolve its commit without
+ * waiting for the Redis index.
+ */
+function collectTickPackageShas(items) {
+    const out = new Map();
+    for (const it of items) {
+        const ref = containerPackageRef(it.env || {});
+        if (!ref || !ref.digest) continue;
+        const sha = commitShaFromTag(ref.tag);
+        if (sha) out.set(`${ ref.name }:${ ref.digest }`, sha);
+    }
+    return out;
+}
+
+/**
+ * Re-key a container package publish onto the commit trackable it was built
+ * from. Mutates `env.extra.dedup_key` / `_commit_sha` only when the target
+ * `github:commit:{sha7}` trackable is live (within EDIT_WINDOW_MS) in this
+ * envelope's room — otherwise the package keeps its own trackable, so a
+ * hex-looking version tag with no matching commit never spawns a bogus
+ * commit message. Returns a trace descriptor.
+ */
+async function attachPackageCommit(env, tickShas = new Map()) {
+    const ref = containerPackageRef(env);
+    if (!ref) return { attached: false };
+    const extra = env.extra;
+
+    let sha = commitShaFromTag(ref.tag);
+    let source = sha ? 'tag' : null;
+    if (sha && ref.digest) {
+        try {
+            await redis.set(pkgDigestKey(ref.name, ref.digest), sha, 'PX', EDIT_WINDOW_MS);
+        } catch (err) {
+            console.warn(`[notif] pkgdigest record failed for ${ ref.name }: ${ err.message }`);
+        }
+    }
+    if (!sha && ref.digest) {
+        sha = tickShas.get(`${ ref.name }:${ ref.digest }`) || null;
+        if (sha) source = 'tick_digest';
+    }
+    if (!sha && ref.digest) {
+        try {
+            sha = await redis.get(pkgDigestKey(ref.name, ref.digest));
+            if (sha) source = 'digest_index';
+        } catch (err) {
+            console.warn(`[notif] pkgdigest lookup failed for ${ ref.name }: ${ err.message }`);
+        }
+    }
+    if (!sha) return { attached: false, reason: 'no_commit_tag', name: ref.name, tag: ref.tag };
+
+    const room = env.room || 'notifications';
+    const commitKey = `github:commit:${ sha }`;
+    let live = false;
+    try {
+        const raw = await redis.hget(recentKey(room), commitKey);
+        if (raw) {
+            const recent = JSON.parse(raw);
+            live = Boolean(recent && recent.activityId && Date.now() - recent.ts < EDIT_WINDOW_MS);
+        }
+    } catch (err) {
+        console.warn(`[notif] package commit lookup failed for ${ commitKey }: ${ err.message }`);
+    }
+    if (!live) return { attached: false, reason: 'no_live_commit_trackable', name: ref.name, tag: ref.tag, sha, source };
+
+    extra._original_dedup_key = extra.dedup_key;
+    extra.dedup_key = commitKey;
+    extra._commit_sha = sha;
+    return { attached: true, name: ref.name, tag: ref.tag, sha, source };
 }
 
 /**
@@ -931,6 +1091,14 @@ function jobIdentity(env) {
         const id = data.comment?.id;
         return id ? `pr_review_comment:${ id }` : null;
     }
+    if (eventType === 'package' || eventType === 'registry_package') {
+        // One bullet per image reference + action: `:f2c9cc915d8b` and
+        // `:latest` stay distinct lines under a commit, while a webhook
+        // re-delivery of the same publish updates its line in place.
+        const pkg = data.__stripped ? null : (data.registry_package ?? data.package);
+        const label = packageLabel(pkg);
+        return label ? `package:${ label }:${ String(data.action || '').trim() }` : null;
+    }
     if (eventType === 'commit_comment') {
         const id = data.comment?.id;
         return id ? `commit_comment:${ id }` : null;
@@ -1103,15 +1271,12 @@ function condensedBulletText(env) {
         // Folded package updates (published → updated) share one trackable;
         // the bullet shows verb + name@version instead of the producer stub.
         const pkg = data.__stripped ? null : (data.registry_package ?? data.package);
-        const name = sanitizeReleaseTitle(pkg?.name);
-        if (!name) return null;
-        const version = sanitizeReleaseTitle(
-            pkg.package_version?.name ?? pkg.package_version?.version ?? pkg.version ?? '',
-            40
-        );
+        const label = packageLabel(pkg);
+        if (!label) return null;
         const verb = packageActionVerb(String(data.action || '').trim());
-        const label = version ? `${ name }@${ version }` : name;
-        return `📦 **${ label }** — ${ verb }`;
+        const url = packageUrl(pkg, extra.repo || '');
+        const linked = url ? `[**${ label }**](${ url })` : `**${ label }**`;
+        return `📦 ${ linked } — ${ verb }`;
     }
     return null;
 }
@@ -1914,6 +2079,7 @@ async function runTick() {
 
         const valid = [];
         const nowSec = Math.floor(Date.now() / 1000);
+        const tickPackageShas = collectTickPackageShas(items);
         for (const it of items) {
             if (it.env.expires_at && it.env.expires_at < nowSec) {
                 stats.expired++;
@@ -2023,6 +2189,29 @@ async function runTick() {
                     pr_number: prContext.pr_number,
                     before: { dedup_key: beforePrKey, _commit_sha: beforePrSha },
                     after: { dedup_key: it.env.extra?.dedup_key, _commit_sha: it.env.extra?._commit_sha }
+                });
+            }
+            // Container image publishes tagged with a commit SHA nest under
+            // that commit's live trackable instead of posting on their own.
+            const pkgCommit = await attachPackageCommit(it.env, tickPackageShas);
+            if (pkgCommit.attached) {
+                console.log(`[notif]   ↳ nesting package ${ pkgCommit.name }:${ pkgCommit.tag || '(digest)' } under commit ${ pkgCommit.sha } (${ pkgCommit.source })`);
+                trace.emit('package_commit_attached', {
+                    room: it.env.room,
+                    name: pkgCommit.name,
+                    tag: pkgCommit.tag,
+                    commit_sha: pkgCommit.sha,
+                    source: pkgCommit.source,
+                    before: { dedup_key: it.env.extra._original_dedup_key },
+                    after: { dedup_key: it.env.extra.dedup_key }
+                });
+            } else if (pkgCommit.reason) {
+                trace.emit('package_commit_skipped', {
+                    room: it.env.room,
+                    name: pkgCommit.name,
+                    tag: pkgCommit.tag,
+                    commit_sha: pkgCommit.sha || null,
+                    reason: pkgCommit.reason
                 });
             }
             // Workflow-flavoured events also seed the per-repo active-workflow
@@ -3086,7 +3275,8 @@ module.exports = {
     prBranchKey, prNumberFromIssue, branchFromRef,
     normalizeGithubDedup,
     // release + package rendering helpers (also used by tests)
-    describeReleaseEvent, describePackageEvent, condensedBulletText,
+    describeReleaseEvent, describePackageEvent, packageLabel, packageUrl, condensedBulletText,
+    containerPackageRef, commitShaFromTag, collectTickPackageShas, attachPackageCommit, pkgDigestKey, jobIdentity,
     renderTrackable, isCommitBullet, collapseCommitBullets,
     COMMIT_COLLAPSE_COUNT
 };
