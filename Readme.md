@@ -330,6 +330,7 @@ This release adds a Redis-backed notification queue consumer, a daily recap Adap
 | `RATE_LIMIT_SEND_WINDOW_MS` | `60000` | Send-endpoint rate limit window |
 | `RATE_LIMIT_SEND_MAX` | `30` | Send-endpoint rate limit max reqs |
 | `NOTIF_COMMIT_GROUP_WINDOW_MS` | `180000` (3 min) | GitHub commit grouping window |
+| `NOTIF_COMMIT_COLLAPSE_COUNT` | `15` | Commit bullets above this count collapse into one comma-separated hash-link line |
 | `NOTIF_DOWNSTREAM_REPOS` | `detain/sugarcraft:sugarcraft/*` | Comma-separated `upstream:glob` pairs. Pushes to a repo matching `glob` are treated as action-triggered and attributed to the most recent active-CI parent in `upstream` |
 
 **GitHub Commit + Job Grouping**
@@ -339,6 +340,7 @@ This release adds a Redis-backed notification queue consumer, a daily recap Adap
 - The resulting message has the **commit header** (SHA + first line of commit message) followed by a `— jobs —` section listing each job's name, failures, status/conclusion, elapsed time, and URL.
 - Subsequent job statuses for the same commit **edit** that same message, updating the job's line in-place as it progresses: queued → in_progress → success/failure.
 - If no event for a given SHA arrives within 3 minutes (`NOTIF_COMMIT_GROUP_WINDOW_MS`), the edit-window cache expires and the next event for that SHA starts a fresh message.
+- When a trackable message holds more commit bullets than `NOTIF_COMMIT_COLLAPSE_COUNT` (default 15), the commit lines collapse into a single comma-separated hash-link list so the newest commits are never lost to tail truncation.
 - `check_suite` and `workflow_run` remain silently filtered (they are aggregates; individual job events carry the detail).
 
 **Action-triggered Push Attribution**
