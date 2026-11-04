@@ -24,7 +24,8 @@ const {
     textJsonBytes,
     fitAttachmentsActivity,
     splitTextIntoChunks,
-    truncateTextToBytes
+    truncateTextToBytes,
+    charCut
 } = require('../lib/messageSize');
 const trace = require('./notifTrace');
 
@@ -39,6 +40,13 @@ const KEY_PREFIX = process.env.NOTIF_KEY_PREFIX || 'notif:';
 const HEARTBEAT_MS = parseInt(process.env.NOTIF_HEARTBEAT_MS || '60000', 10);
 const APPEND_BREAK = '\n\n— · —\n\n';
 const APPEND_TRAIL_SUMMARY_AFTER = 3;
+// Trackables holding more commit bullets than this collapse into one comma-
+// separated hash-link line, so the newest commits never fall off the end
+// under guardActivity's tail-truncation.
+const COMMIT_COLLAPSE_COUNT = (() => {
+    const parsed = parseInt(process.env.NOTIF_COMMIT_COLLAPSE_COUNT || '', 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 15;
+})();
 
 // ---------------------------------------------------------------------------
 // Oversized-activity guard (hard backstop)
@@ -408,6 +416,70 @@ function describeRefEvent(eventType, data, repo, { withRepo }) {
     return withRepo ? `${ line } in [${ repo }](https://github.com/${ repo }).` : line;
 }
 
+// Friendly verb per GitHub release action. Unknown actions pass through
+// verbatim — the payload's own word is more honest than a wrong mapping.
+const RELEASE_ACTION_WORDS = {
+    published: 'published',
+    released: 'published',
+    created: 'created',
+    edited: 'edited',
+    prereleased: 'prereleased',
+    deleted: 'deleted'
+};
+
+/**
+ * Strip markdown control characters from a release name/tag and cap it, so
+ * payload text can never unbalance the surrounding `**bold**` / `[link](url)`
+ * syntax. Returns '' for nothing renderable.
+ */
+function sanitizeReleaseTitle(value) {
+    const cleaned = String(value ?? '')
+        .replace(/[[\]()*~_+`\\]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!cleaned) return '';
+    const capped = charCut(cleaned, 80);
+    return capped.length < cleaned.length ? `${ capped }…` : capped;
+}
+
+/**
+ * Build the descriptive one-line message for a GitHub `release` event,
+ * replacing the producer's `triggered a **release** event` stub. Returns
+ * null (keep the stub) when the payload is stripped or lacks a usable
+ * tag_name. Format:
+ *
+ *   🚀 published [**Sugarcraft v1.2.3**](url) — v1.2.3 on [detain/sugarcraft](https://github.com/detain/sugarcraft).
+ *   🧪 prereleased [**v1.0.0-rc1**](url) _(pre-release)_ on [detain/sugarcraft](...).
+ */
+function describeReleaseEvent(data, repo) {
+    if (!data || data.__stripped) return null;
+    const release = data.release;
+    if (!release) return null;
+    const rawTag = String(release.tag_name || '').trim();
+    const tag = sanitizeReleaseTitle(rawTag);
+    if (!tag) return null;
+
+    const rawName = String(release.name || '').trim();
+    const name = sanitizeReleaseTitle(rawName);
+    const showTagNote = Boolean(name) && rawName !== rawTag;
+
+    const htmlUrl = String(release.html_url || '').trim();
+    let url = '';
+    if (/^https:\/\//i.test(htmlUrl)) url = htmlUrl;
+    else if (repo) url = `https://github.com/${ repo }/releases/tag/${ encodeURIComponent(rawTag) }`;
+    else if (htmlUrl) url = htmlUrl;
+
+    const title = showTagNote ? name : tag;
+    const linked = url ? `[**${ title }**](${ url })` : `**${ title }**`;
+    const tagNote = showTagNote ? ` — ${ tag }` : '';
+    const emoji = release.prerelease ? '🧪' : '🚀';
+    const preNote = release.prerelease ? ' _(pre-release)_' : '';
+    const action = String(data.action || '').trim();
+    const verb = RELEASE_ACTION_WORDS[action] || action || 'updated';
+    const repoTail = repo ? ` on [${ repo }](https://github.com/${ repo }).` : '';
+    return `${ emoji } ${ verb } ${ linked }${ tagNote }${ preNote }${ repoTail }`;
+}
+
 /**
  * Reroute the envelope into a PR trackable when the event is implicitly
  * tied to a PR. Mutates `env.extra` (and `env.message` for `delete`
@@ -490,6 +562,19 @@ async function attachPrContext(env) {
                 extra._commit_sha = `pr:${ repo }:${ prNumber }`;
                 return { rerouted: true, reason: 'branch_is_pr_head', pr_number: prNumber };
             }
+        }
+        return { rerouted: false };
+    }
+
+    // release → rewrite the producer stub into a descriptive tag/title line.
+    // Only the stub is replaced (same guard as create/delete above); custom
+    // producer text survives untouched, and stripped/missing data fails
+    // soft to the stub via describeReleaseEvent returning null.
+    if (eventType === 'release') {
+        const stubRe = /triggered\s+a\s+\*?\*?release\*?\*?\s+event/i;
+        const described = describeReleaseEvent(data, repo);
+        if (described && stubRe.test(env.message || '')) {
+            env.message = described;
         }
         return { rerouted: false };
     }
@@ -864,6 +949,22 @@ function condensedBulletText(env) {
         // already names the repo — drop the "in [repo](…)" tail.
         return describeRefEvent(eventType, data, extra.repo || '', { withRepo: false });
     }
+    if (eventType === 'release') {
+        // Folded release updates (published → edited) share one trackable;
+        // the bullet shows verb + title/tag instead of the producer stub.
+        const release = data.__stripped ? null : data.release;
+        const rawTag = String(release?.tag_name || '').trim();
+        if (!rawTag) return null;
+        const tag = sanitizeReleaseTitle(rawTag);
+        if (!tag) return null;
+        const rawName = String(release.name || '').trim();
+        const name = sanitizeReleaseTitle(rawName);
+        const action = String(data.action || '').trim();
+        const verb = RELEASE_ACTION_WORDS[action] || action || 'updated';
+        const emoji = release.prerelease ? '🧪' : '🚀';
+        const title = name && rawName !== rawTag ? `**${ name }** (${ tag })` : `**${ tag }**`;
+        return `${ emoji } ${ title } — ${ verb }`;
+    }
     return null;
 }
 
@@ -1148,15 +1249,76 @@ function emitLeafBucket(lines, level, leaves) {
 }
 
 /**
+ * Commit bullets render as a leading markdown link whose label is a bare
+ * SHA (or whose URL goes through GitHub's /commit/ endpoint):
+ *   • [4fd48e4](https://github.com/owner/repo/commit/4fd48e4…) _msg_ (~1 files)
+ * COMMIT_LINK_PREFIX_RE anchors at the text start (generous label) for
+ * detection; COMMIT_LINK_RE requires a hex label anywhere for extraction.
+ */
+const COMMIT_LINK_PREFIX_RE = /^\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/i;
+const COMMIT_LINK_RE = /\[([0-9a-f]{7,40})\]\((https?:\/\/[^)\s]+)\)/i;
+
+/**
+ * True when an item's text leads with a commit link — URL through /commit/
+ * or a 7–40 char hex label. Deterministic: only the leading markdown link
+ * is inspected, so prose bullets with incidental hex never qualify.
+ */
+function isCommitBullet(itemText) {
+    const m = String(itemText || '').trim().match(COMMIT_LINK_PREFIX_RE);
+    if (!m) return false;
+    const [, label, url] = m;
+    if (/(?:^|\/)commit\//i.test(url)) return true;
+    return /^[0-9a-f]{7,40}$/i.test(label);
+}
+
+/**
+ * Collapse commit bullets into one `- Commits: [sha7](url), …` line. Every
+ * link is kept (labels shortened to 7 chars); the per-commit message and
+ * file-count annotations are sacrificed so the trackable stays under Teams'
+ * activity cap instead of losing the newest commits to tail truncation.
+ * Returns null when no item carries an extractable commit link.
+ */
+function collapseCommitBullets(items) {
+    const links = [];
+    for (const item of items) {
+        const text = typeof item === 'string' ? item : (item && item.text) || '';
+        const m = text.match(COMMIT_LINK_RE);
+        if (!m) continue;
+        links.push(`[${ m[1].slice(0, 7) }](${ m[2] })`);
+    }
+    if (links.length === 0) return null;
+    return bulletPrefix(1) + `Commits: ${ links.join(', ') }`;
+}
+
+/**
  * Render a trackable to its final text. Non-check_run items render as
  * flat top-level bullets in insertion order; check_run items whose name
  * decomposes are collected and rendered as a single adaptively-nested
  * tree below the flat items (see `renderChecksGrouped`).
+ *
+ * Commit bullets collapse into one comma-separated hash-link line when
+ * either trigger fires: more than COMMIT_COLLAPSE_COUNT commits, or the
+ * expanded render would exceed MAX_ACTIVITY_BYTES (which previously meant
+ * guardActivity tail-truncated and silently dropped the newest commits).
+ * If even the collapsed form is too big, guardActivity's truncation stays
+ * as the backstop.
  */
 function renderTrackable(header, items) {
+    const commitCount = items.reduce((acc, it) => acc + (isCommitBullet(it && it.text) ? 1 : 0), 0);
+    if (commitCount > COMMIT_COLLAPSE_COUNT) return renderTrackableBody(header, items, true);
+    const expanded = renderTrackableBody(header, items, false);
+    if (commitCount > 1 && activityBytes({ type: 'message', text: expanded }) > MAX_ACTIVITY_BYTES) {
+        return renderTrackableBody(header, items, true);
+    }
+    return expanded;
+}
+
+function renderTrackableBody(header, items, collapseCommits) {
     const headerText = String(header || '').trim();
     const flatBullets = [];
     const checkItems = [];
+    const commitLinks = [];
+    let commitSlot = null; // flatBullets index where the collapsed line belongs
 
     for (const item of items) {
         if (item.identity && item.identity.startsWith('check_run:')) {
@@ -1176,8 +1338,20 @@ function renderTrackable(header, items) {
                 continue;
             }
         }
+        if (collapseCommits) {
+            const linkMatch = String(item.text || '').match(COMMIT_LINK_RE);
+            if (linkMatch) {
+                if (commitSlot === null) commitSlot = flatBullets.length;
+                commitLinks.push(`[${ linkMatch[1].slice(0, 7) }](${ linkMatch[2] })`);
+                continue;
+            }
+        }
         const bullet = indentAsBullet(item.text);
         if (bullet) flatBullets.push(bullet);
+    }
+
+    if (commitLinks.length > 0) {
+        flatBullets.splice(commitSlot, 0, bulletPrefix(1) + `Commits: ${ commitLinks.join(', ') }`);
     }
 
     const lines = [];
@@ -2737,5 +2911,9 @@ module.exports = {
     buildConstructedConvRef,
     attachPrContext, recordPrBranch, lookupPrByBranch,
     prBranchKey, prNumberFromIssue, branchFromRef,
-    normalizeGithubDedup
+    normalizeGithubDedup,
+    // release rendering + commit-collapse helpers (also used by tests)
+    describeReleaseEvent, condensedBulletText,
+    renderTrackable, isCommitBullet, collapseCommitBullets,
+    COMMIT_COLLAPSE_COUNT
 };

@@ -1,7 +1,12 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
 
-const { mergeGithubTrackable, parseDownstreamMap, isActionTriggeredPush, normalizeGithubDedup, NOTIF_PR_BRANCH_TTL_MS } = require('../server/queue/notificationConsumer');
+const { activityBytes, MAX_ACTIVITY_BYTES } = require('../server/lib/messageSize');
+const {
+    mergeGithubTrackable, parseDownstreamMap, isActionTriggeredPush, normalizeGithubDedup,
+    NOTIF_PR_BRANCH_TTL_MS, renderTrackable, isCommitBullet, collapseCommitBullets
+} = require('../server/queue/notificationConsumer');
 
 // The renderer uses regular Markdown nested bullets (ASCII spaces) when
 // the tree never goes deeper than Teams' single level of native nesting,
@@ -803,5 +808,110 @@ describe('mergeGithubTrackable — branch delete nested under its PR', () => {
     it('a single-line header keeps its bullets directly underneath', () => {
         const r1 = mergeGithubTrackable(emptyRecent(), pushEnv());
         assert.ok(!r1.text.includes('\n\n'), r1.text);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Commit bullet collapse
+// ---------------------------------------------------------------------------
+
+function commitItem(i, msgFiller = '') {
+    const sha = (i + 1).toString(16).padStart(7, '0');
+    return {
+        identity: null,
+        text: `[${ sha }](https://github.com/o/r/commit/${ sha }) _msg ${ i }${ msgFiller }_ (~1 files)`
+    };
+}
+
+describe('isCommitBullet', () => {
+    it('accepts /commit/ urls and hex labels', () => {
+        assert.equal(isCommitBullet('[4fd48e4](https://github.com/o/r/commit/4fd48e4) hi'), true);
+        assert.equal(isCommitBullet('[deadbeefdeadbeefdeadbeefdeadbeefdeadbeef](https://example/x) note'), true);
+    });
+    it('rejects prose and non-commit leading links', () => {
+        assert.equal(isCommitBullet('plain text'), false);
+        assert.equal(isCommitBullet('[build](https://ci.example/builds/1) status'), false);
+        assert.equal(isCommitBullet('see [a1b2c3d](https://example/x) inline'), false);
+    });
+});
+
+describe('collapseCommitBullets', () => {
+    it('joins all commit links comma-separated with 7-char labels', () => {
+        const line = collapseCommitBullets([commitItem(0), commitItem(1)]);
+        assert.equal(line, '- Commits: [0000001](https://github.com/o/r/commit/0000001), [0000002](https://github.com/o/r/commit/0000002)');
+    });
+    it('returns null when nothing extracts', () => {
+        assert.equal(collapseCommitBullets([{ identity: null, text: 'no links here' }]), null);
+    });
+});
+
+describe('renderTrackable — commit collapse', () => {
+    it('collapses more than COMMIT_COLLAPSE_COUNT commits into one hash line', () => {
+        const items = Array.from({ length: 20 }, (_, i) => commitItem(i));
+        const out = renderTrackable('📦 pushed 20 commits', items);
+        assert.ok(out.startsWith('📦 pushed 20 commits\n- Commits: '), out);
+        const linkCount = (out.match(/\[00000/g) || []).length;
+        assert.equal(linkCount, 20, 'all 20 links survive');
+        assert.ok(!out.includes('_msg'), 'per-commit messages dropped');
+        assert.equal(out.split('\n').length, 2, 'one collapsed line only');
+    });
+
+    it('keeps normal bullets under the threshold', () => {
+        const items = Array.from({ length: 5 }, (_, i) => commitItem(i));
+        const out = renderTrackable('📦 header', items);
+        assert.ok(!out.includes('Commits:'), out);
+        assert.equal(out.split('\n').length, 6, 'header + 5 bullets');
+        assert.ok(out.includes('_msg 0_'), out);
+    });
+
+    it('collapses on size overflow even below the count threshold', () => {
+        const items = Array.from({ length: 8 }, (_, i) => commitItem(i, '-' + 'x'.repeat(4000)));
+        const expanded = renderTrackable('hdr', items.slice(0, 1)); // sanity: single stays expanded
+        assert.ok(!expanded.includes('Commits:'), expanded.slice(0, 80));
+        const out = renderTrackable('hdr', items);
+        assert.ok(out.includes('- Commits: '), 'size trigger fired');
+        assert.ok(activityBytes({ type: 'message', text: out }) <= MAX_ACTIVITY_BYTES, 'collapsed form fits');
+    });
+
+    it('keeps non-commit items as their own bullets in order', () => {
+        const items = [
+            { identity: null, text: '🔄 Workflow queued' },
+            commitItem(0, '-' + 'y'.repeat(13000)),
+            { identity: null, text: 'ℹ️ note between commits' },
+            commitItem(1, '-' + 'y'.repeat(13000))
+        ];
+        const out = renderTrackable('hdr', items);
+        assert.ok(out.includes('- 🔄 Workflow queued'), 'workflow keeps its bullet');
+        assert.ok(out.includes('- ℹ️ note between commits'), 'prose keeps its bullet');
+        const lines = out.split('\n');
+        assert.equal(lines.length, 4, 'header + 2 plain bullets + collapsed line');
+        assert.equal(lines[0], 'hdr');
+        // Collapsed line takes the position of the first commit item:
+        // after the workflow bullet, before the interleaved prose note.
+        assert.ok(lines[1].startsWith('- 🔄 Workflow queued'), lines[1]);
+        assert.ok(lines[2].startsWith('- Commits: [0000001]'), lines[2].slice(0, 60));
+        assert.ok(lines[2].includes('[0000002]'), 'both commit links share one collapsed line');
+        assert.ok(lines[3].startsWith('- ℹ️ note between commits'), lines[3]);
+    });
+
+    it('honors NOTIF_COMMIT_COLLAPSE_COUNT via environment (child process)', () => {
+        const script = `
+            process.env.NOTIF_TRACE_LOG = '0';
+            const { renderTrackable, COMMIT_COLLAPSE_COUNT } = require('./server/queue/notificationConsumer');
+            const items = Array.from({ length: 5 }, (_, i) => {
+                const sha = (i + 1).toString(16).padStart(7, '0');
+                return { identity: null, text: \`[\${ sha }](https://github.com/o/r/commit/\${ sha }) _m\` };
+            });
+            const out = renderTrackable('hdr', items);
+            console.log(JSON.stringify({ count: COMMIT_COLLAPSE_COUNT, collapsed: out.includes('- Commits: ') }));
+        `;
+        const stdout = execFileSync(process.execPath, ['-e', script], {
+            cwd: __dirname + '/..',
+            env: { ...process.env, NOTIF_COMMIT_COLLAPSE_COUNT: '3' },
+            encoding: 'utf8'
+        });
+        const result = JSON.parse(stdout.trim().split('\n').pop());
+        assert.equal(result.count, 3, 'env override parsed');
+        assert.equal(result.collapsed, true, '5 items collapse at threshold 3');
     });
 });

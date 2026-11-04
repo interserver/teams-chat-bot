@@ -344,3 +344,154 @@ describe('prNumberFromIssue + branchFromRef helpers', () => {
         assert.equal(branchFromRef(null), '');
     });
 });
+
+// ---------------------------------------------------------------------------
+// Release event rendering
+// ---------------------------------------------------------------------------
+
+const RELEASE_STUB = 'ℹ️ github-actions[bot] triggered a **release** event (edited) on [detain/sugarcraft](https://github.com/detain/sugarcraft).';
+
+describe('describeReleaseEvent', () => {
+    const { describeReleaseEvent } = consumer;
+
+    it('describes an edited release with name + tag note + links', () => {
+        const line = describeReleaseEvent({
+            action: 'edited',
+            release: {
+                tag_name: 'v1.2.3',
+                name: 'Sugarcraft v1.2.3',
+                html_url: 'https://github.com/detain/sugarcraft/releases/tag/v1.2.3'
+            }
+        }, 'detain/sugarcraft');
+        assert.equal(line, '🚀 edited [**Sugarcraft v1.2.3**](https://github.com/detain/sugarcraft/releases/tag/v1.2.3) — v1.2.3 on [detain/sugarcraft](https://github.com/detain/sugarcraft).');
+    });
+
+    it('maps released → published and shows bare tag when name matches tag', () => {
+        const line = describeReleaseEvent({
+            action: 'released',
+            release: { tag_name: 'v2.0.0', name: 'v2.0.0', html_url: 'https://github.com/o/r/releases/tag/v2.0.0' }
+        }, 'o/r');
+        assert.equal(line, '🚀 published [**v2.0.0**](https://github.com/o/r/releases/tag/v2.0.0) on [o/r](https://github.com/o/r).');
+    });
+
+    it('marks pre-releases with the test-tube emoji and note', () => {
+        const line = describeReleaseEvent({
+            action: 'prereleased',
+            release: { tag_name: 'v2.0.0-rc1', prerelease: true }
+        }, 'detain/sugarcraft');
+        assert.equal(line, '🧪 prereleased [**v2.0.0-rc1**](https://github.com/detain/sugarcraft/releases/tag/v2.0.0-rc1) _(pre-release)_ on [detain/sugarcraft](https://github.com/detain/sugarcraft).');
+    });
+
+    it('builds the tag URL when html_url is missing', () => {
+        const line = describeReleaseEvent({
+            release: { tag_name: 'v 1.0 & beta' }
+        }, 'o/r');
+        assert.ok(line.includes('https://github.com/o/r/releases/tag/v%201.0%20%26%20beta'), line);
+    });
+
+    it('sanitizes markdown control characters out of titles', () => {
+        const line = describeReleaseEvent({
+            release: { tag_name: 'v1', name: 'A [bug] *fix* (wip)' }
+        }, 'o/r');
+        assert.ok(line.includes('[**A bug fix wip**]'), line);
+        assert.ok(!/\[[^\]]*\[[^\]]*\]/.test(line), 'no nested brackets in link label');
+    });
+
+    it('caps long names with an ellipsis', () => {
+        const line = describeReleaseEvent({
+            release: { tag_name: 'v1', name: 'x'.repeat(120) }
+        }, 'o/r');
+        assert.ok(line.includes('…'), line);
+        assert.ok(!line.includes('x'.repeat(81)), 'name capped at 80 chars');
+    });
+
+    it('returns null without a tag_name or with stripped data', () => {
+        assert.equal(describeReleaseEvent({ release: {} }, 'o/r'), null);
+        assert.equal(describeReleaseEvent({ release: { tag_name: '   ' } }, 'o/r'), null);
+        assert.equal(describeReleaseEvent({ __stripped: true }, 'o/r'), null);
+        assert.equal(describeReleaseEvent({}, 'o/r'), null);
+    });
+});
+
+describe('attachPrContext — release stub rewrite', () => {
+    let originals;
+    let redisMock;
+
+    before(() => {
+        redisMock = makeRedisMock();
+        originals = _setInternalsForTest({ redis: redisMock });
+    });
+    after(() => {
+        _setInternalsForTest(originals || {});
+    });
+
+    function releaseEnv(message, data) {
+        return {
+            type: 'msg',
+            message,
+            extra: {
+                event_type: 'release',
+                repo: 'detain/sugarcraft',
+                dedup_key: 'github:release:detain/sugarcraft:v1.2.3',
+                data
+            }
+        };
+    }
+
+    it('rewrites the release stub to the described line', async () => {
+        const env = releaseEnv(RELEASE_STUB, {
+            action: 'edited',
+            release: {
+                tag_name: 'v1.2.3',
+                name: 'Sugarcraft v1.2.3',
+                html_url: 'https://github.com/detain/sugarcraft/releases/tag/v1.2.3'
+            }
+        });
+        const result = await attachPrContext(env);
+        assert.equal(result.rerouted, false);
+        assert.equal(env.message, '🚀 edited [**Sugarcraft v1.2.3**](https://github.com/detain/sugarcraft/releases/tag/v1.2.3) — v1.2.3 on [detain/sugarcraft](https://github.com/detain/sugarcraft).');
+    });
+
+    it('keeps the stub when the envelope data was stripped (fail-soft)', async () => {
+        const env = releaseEnv(RELEASE_STUB, { __stripped: true, release: 'oversized' });
+        await attachPrContext(env);
+        assert.equal(env.message, RELEASE_STUB);
+    });
+
+    it('never clobbers a non-stub producer message', async () => {
+        const custom = 'Custom release announcement: v1.2.3 is out!';
+        const env = releaseEnv(custom, {
+            action: 'published',
+            release: { tag_name: 'v1.2.3', html_url: 'https://github.com/detain/sugarcraft/releases/tag/v1.2.3' }
+        });
+        await attachPrContext(env);
+        assert.equal(env.message, custom);
+    });
+});
+
+describe('condensedBulletText — release branch', () => {
+    const { condensedBulletText } = consumer;
+
+    it('condenses a release event to emoji + title + verb', () => {
+        const bullet = condensedBulletText({
+            extra: {
+                event_type: 'release',
+                repo: 'detain/sugarcraft',
+                data: { action: 'edited', release: { tag_name: 'v1.2.3', name: 'Sugarcraft v1.2.3' } }
+            }
+        });
+        assert.equal(bullet, '🚀 **Sugarcraft v1.2.3** (v1.2.3) — edited');
+    });
+
+    it('renders bare tag when no distinct name', () => {
+        const bullet = condensedBulletText({
+            extra: { event_type: 'release', data: { action: 'published', release: { tag_name: 'v9.9.9' } } }
+        });
+        assert.equal(bullet, '🚀 **v9.9.9** — published');
+    });
+
+    it('returns null for stripped or tagless data', () => {
+        assert.equal(condensedBulletText({ extra: { event_type: 'release', data: { __stripped: true } } }), null);
+        assert.equal(condensedBulletText({ extra: { event_type: 'release', data: { action: 'edited', release: {} } } }), null);
+    });
+});
