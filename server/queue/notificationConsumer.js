@@ -46,6 +46,11 @@ const PKG_DEFER_MS = parseInt(process.env.NOTIF_PKG_DEFER_MS || '15000', 10);
 const PKG_ACTIVE_CI_MS = parseInt(process.env.NOTIF_PKG_ACTIVE_CI_MS || String(10 * 60 * 1000), 10);
 // How long a learned package → builder-repo mapping is kept.
 const PKG_REPO_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// Last-resort link for a floating tag whose digest never matches a SHA-tagged
+// image (`buildcache`, `buildcache-intel` — cache manifests have their own
+// digest): the commit a SHA-tagged image of the SAME package linked to within
+// this many ms. Used only once the defer window has run out.
+const PKG_SIBLING_MS = parseInt(process.env.NOTIF_PKG_SIBLING_MS || String(5 * 60 * 1000), 10);
 const HEARTBEAT_MS = parseInt(process.env.NOTIF_HEARTBEAT_MS || '60000', 10);
 const APPEND_BREAK = '\n\n— · —\n\n';
 const APPEND_TRAIL_SUMMARY_AFTER = 3;
@@ -155,6 +160,9 @@ function pkgDigestKey(name, digest) { return k('pkgdigest:') + name + ':' + dige
 // not always the repo that builds them (phlix-hub is filed under phlix-server).
 function shaRepoKey(sha) { return k('sharepo:') + sha; }
 function pkgRepoKey(name) { return k('pkgrepo:') + name; }
+// Package name → commits its SHA-tagged images recently linked to (sorted
+// set, member = sha7, score = link ts). Backs attachPackageSibling().
+function pkgShaKey(name) { return k('pkgsha:') + name; }
 
 // ---------------------------------------------------------------------------
 // Action-triggered push attribution
@@ -578,7 +586,12 @@ function packageLabel(pkg) {
     const rawType = String(pkg.package_type || '').trim().toLowerCase();
     const tagMeta = pv.container_metadata?.tag;
     const isContainer = CONTAINER_PACKAGE_TYPES.has(rawType) || Boolean(tagMeta);
-    const tag = sanitizeReleaseTitle(String(tagMeta?.name ?? '').trim(), 40);
+    // A full 40-hex SHA inside a tag (`<sha>`, `<sha>-intel`) shortens to 12
+    // hex so the 40-char cap never eats the variant suffix — the label is
+    // also the bullet identity, and `<sha>-intel` / `<sha>-latest` must not
+    // collapse into one bullet.
+    const rawTag = String(tagMeta?.name ?? '').trim().replace(/[0-9a-f]{40}/gi, m => m.slice(0, 12));
+    const tag = sanitizeReleaseTitle(rawTag, 40);
     if (isContainer && tag) return `${ name }:${ tag }`;
 
     const rawVersion = String(pv.name ?? pv.version ?? pkg.version ?? '').trim();
@@ -656,7 +669,13 @@ function describePackageEvent(data, repo) {
 // `github:commit:{sha7}` trackable exists in the same room, the publish is
 // re-keyed onto it and renders as a nested bullet under the commit.
 
+// Bare short/full SHA (`f2c9cc915d8b`), metadata-action's `type=sha` form
+// (`sha-f2c9cc9`), or a full 40-hex SHA with a variant affix
+// (`<sha>-intel`, `intel-<sha>`). Affixed forms other than `sha-` require
+// the FULL SHA so date-ish or hex-ish words never pass as commits.
 const COMMIT_TAG_RE = /^[0-9a-f]{7,40}$/i;
+const SHA_PREFIX_TAG_RE = /^sha-([0-9a-f]{7,40})$/i;
+const AFFIXED_FULL_SHA_RE = /(?:^|[-_.])([0-9a-f]{40})(?:$|[-_.])/i;
 
 /**
  * Pull `{ name, tag, digest }` out of a container package envelope, or null
@@ -680,9 +699,12 @@ function containerPackageRef(env) {
     return { name, tag, digest };
 }
 
-/** sha7 when the tag looks like a commit SHA, else null. */
+/** sha7 when the tag names a commit SHA (see COMMIT_TAG_RE family), else null. */
 function commitShaFromTag(tag) {
-    return COMMIT_TAG_RE.test(tag || '') ? tag.slice(0, 7).toLowerCase() : null;
+    const t = String(tag || '');
+    if (COMMIT_TAG_RE.test(t)) return t.slice(0, 7).toLowerCase();
+    const m = SHA_PREFIX_TAG_RE.exec(t) || AFFIXED_FULL_SHA_RE.exec(t);
+    return m ? m[1].slice(0, 7).toLowerCase() : null;
 }
 
 /**
@@ -844,6 +866,7 @@ async function attachPackageCommit(env, tickShas = new Map()) {
         } catch (err) {
             console.warn(`[notif] pkgrepo learn failed for ${ ref.name }: ${ err.message }`);
         }
+        await recordPackageSha(ref.name, sha);
     }
 
     const commitKey = `github:commit:${ sha }`;
@@ -855,6 +878,51 @@ async function attachPackageCommit(env, tickShas = new Map()) {
     extra.dedup_key = commitKey;
     extra._commit_sha = sha;
     return { attached: true, name: ref.name, tag: ref.tag, sha, source };
+}
+
+/** Remember that a SHA-tagged image of package `name` was built from `sha`. */
+async function recordPackageSha(name, sha, now = Date.now()) {
+    if (PKG_SIBLING_MS <= 0) return;
+    try {
+        const pipe = redis.pipeline();
+        pipe.zadd(pkgShaKey(name), now, sha);
+        pipe.zremrangebyscore(pkgShaKey(name), 0, now - PKG_SIBLING_MS);
+        pipe.pexpire(pkgShaKey(name), PKG_SIBLING_MS);
+        await pipe.exec();
+    } catch (err) {
+        console.warn(`[notif] pkgsha record failed for ${ name }: ${ err.message }`);
+    }
+}
+
+/**
+ * Last-resort link for a floating-tag container publish that no digest ever
+ * maps to a commit — chiefly `buildcache` / `buildcache-<variant>`, whose
+ * cache manifest has its own digest and no SHA-tagged twin. The cache export
+ * runs right after the image push in the same build step, so the commit a
+ * SHA-tagged image of the same package linked to within PKG_SIBLING_MS is
+ * the one that built it. Overlapping builds pick the most recent link with a
+ * live trackable in the room. The caller runs this only after the defer
+ * window is exhausted, so digest links always win when they exist.
+ */
+async function attachPackageSibling(env, now = Date.now()) {
+    const ref = containerPackageRef(env);
+    if (!ref || PKG_SIBLING_MS <= 0) return { attached: false };
+    let members = [];
+    try {
+        members = await redis.zrevrangebyscore(pkgShaKey(ref.name), '+inf', now - PKG_SIBLING_MS, 'LIMIT', 0, 5);
+    } catch (err) {
+        console.warn(`[notif] pkgsha lookup failed for ${ ref.name }: ${ err.message }`);
+    }
+    const room = env.room || 'notifications';
+    for (const sha of members || []) {
+        if (!await isLiveCommitTrackable(room, sha)) continue;
+        const extra = env.extra;
+        extra._original_dedup_key = extra.dedup_key;
+        extra.dedup_key = `github:commit:${ sha }`;
+        extra._commit_sha = sha;
+        return { attached: true, name: ref.name, tag: ref.tag, sha, source: 'recent_sibling', candidates: members.length };
+    }
+    return { attached: false, reason: 'no_recent_sibling', name: ref.name, tag: ref.tag, candidates: (members || []).length };
 }
 
 /**
@@ -2312,7 +2380,7 @@ async function runTick() {
             }
             // Container image publishes tagged with a commit SHA nest under
             // that commit's live trackable instead of posting on their own.
-            const pkgCommit = await attachPackageCommit(it.env, tickPackageShas);
+            let pkgCommit = await attachPackageCommit(it.env, tickPackageShas);
             if (shouldDeferPackage(it.env, pkgCommit) && await deferPackageItem(it)) {
                 trace.emit('package_deferred', {
                     room: it.env.room,
@@ -2324,6 +2392,14 @@ async function runTick() {
                 });
                 stats.deferred++;
                 continue;
+            }
+            // Waited out (or never deferrable) and still unlinked: fall back
+            // to the commit a SHA-tagged image of the same package just
+            // linked to — catches `buildcache*` tags, whose digest is unique.
+            if (!pkgCommit.attached && pkgCommit.reason === 'no_commit_tag') {
+                const sibling = await attachPackageSibling(it.env);
+                if (sibling.attached) pkgCommit = sibling;
+                else pkgCommit = { ...pkgCommit, reason: sibling.reason || pkgCommit.reason };
             }
             if (pkgCommit.attached) {
                 console.log(`[notif]   ↳ nesting package ${ pkgCommit.name }:${ pkgCommit.tag || '(digest)' } under commit ${ pkgCommit.sha } (${ pkgCommit.source })`);
@@ -3409,6 +3485,7 @@ module.exports = {
     describeReleaseEvent, describePackageEvent, packageLabel, packageUrl, condensedBulletText,
     containerPackageRef, commitShaFromTag, collectTickPackageShas, attachPackageCommit, pkgDigestKey, jobIdentity,
     shouldDeferPackage, deferPackageItem, PKG_DEFER_MS, PKG_ACTIVE_CI_MS, soleActiveCommit, shaRepoKey, pkgRepoKey,
+    attachPackageSibling, recordPackageSha, pkgShaKey, PKG_SIBLING_MS,
     renderTrackable, isCommitBullet, collapseCommitBullets,
     COMMIT_COLLAPSE_COUNT
 };

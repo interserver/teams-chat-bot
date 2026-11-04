@@ -841,6 +841,18 @@ describe('attachPackageCommit — nest SHA-tagged images under their commit', ()
             .filter(([, score]) => score >= min)
             .sort((a, b) => b[1] - a[1])
             .map(([member]) => member);
+        // Pipeline over the same sorted sets (recordPackageSha / recordActiveWorkflow).
+        redisMock.pipeline = () => {
+            const ops = [];
+            const chain = {
+                zadd(key, score, member) { ops.push(() => { if (!redisMock._zsets.has(key)) redisMock._zsets.set(key, new Map()); redisMock._zsets.get(key).set(member, score); }); return chain; },
+                zremrangebyscore(key, min, max) { ops.push(() => { for (const [m, sc] of redisMock._zsets.get(key) || []) if (sc >= min && sc <= max) redisMock._zsets.get(key).delete(m); }); return chain; },
+                expire() { return chain; },
+                pexpire() { return chain; },
+                async exec() { ops.forEach(op => op()); return []; }
+            };
+            return chain;
+        };
         originals = _setInternalsForTest({ redis: redisMock });
     });
     after(() => {
@@ -984,13 +996,8 @@ describe('attachPackageCommit — nest SHA-tagged images under their commit', ()
     });
 
     it('recordActiveWorkflow seeds the sha → repo index', async () => {
-        redisMock.pipeline = () => {
-            const chain = { zadd() { return chain; }, zremrangebyscore() { return chain; }, expire() { return chain; }, async exec() { return []; } };
-            return chain;
-        };
         await consumer.recordActiveWorkflow({ extra: { event_type: 'workflow_job', repo: 'detain/phlix-hub', _commit_sha: 'f2c9cc9' } });
         assert.equal(await redisMock.get(consumer.shaRepoKey('f2c9cc9')), 'detain/phlix-hub');
-        delete redisMock.pipeline;
     });
 
     it('defers an unlinked floating tag until PKG_DEFER_MS has passed', () => {
@@ -1037,6 +1044,92 @@ describe('attachPackageCommit — nest SHA-tagged images under their commit', ()
         await deferPackageItem({ raw: ops[0]?.[2] || JSON.stringify(requeued), env: requeued }, 9000);
         assert.equal(JSON.parse(ops[0][2]).extra._pkg_defer_since, 1000);
         delete redisMock.multi;
+    });
+
+    // phlix-server's docker.yml tags each runtime leg `<full-sha>-<variant>`
+    // next to its floating tag, and exports `buildcache-<variant>` with a
+    // digest of its own (regression: 1afd76f, 2026-11-04, 4 split messages).
+    const FULL_SHA = '1afd76fc6a54e36412348024f4b937e8fbabec41';
+
+    it('recognises affixed full-SHA tags and the sha- prefix form', () => {
+        assert.equal(commitShaFromTag(`${ FULL_SHA }-intel`), '1afd76f');
+        assert.equal(commitShaFromTag(`nvidia-${ FULL_SHA }`), '1afd76f');
+        assert.equal(commitShaFromTag(`${ FULL_SHA }_latest`), '1afd76f');
+        assert.equal(commitShaFromTag('sha-1afd76f'), '1afd76f');
+        assert.equal(commitShaFromTag(FULL_SHA), '1afd76f');
+        // Short hex with an affix is too ambiguous to trust.
+        assert.equal(commitShaFromTag('intel-1afd76f'), null);
+        assert.equal(commitShaFromTag('buildcache-intel'), null);
+        assert.equal(commitShaFromTag(`${ FULL_SHA }0-intel`), null, '41 hex is not a SHA');
+    });
+
+    it('labels full-SHA tags with a 12-hex SHA so variant suffixes survive', () => {
+        const { packageLabel } = consumer;
+        const pkg = (tag) => pkgEnv(tag).extra.data.registry_package;
+        assert.equal(packageLabel(pkg(`${ FULL_SHA }-intel`)), 'phlix-hub:1afd76fc6a54-intel');
+        assert.equal(packageLabel(pkg(FULL_SHA)), 'phlix-hub:1afd76fc6a54');
+        const ids = ['intel', 'latest', 'nvidia'].map(v => jobIdentity(pkgEnv(`${ FULL_SHA }-${ v }`)));
+        assert.equal(new Set(ids).size, 3, ids.join(' | '));
+    });
+
+    it('nests `<sha>-intel` and then its floating `intel` tag under the commit', async () => {
+        seedLiveCommits(['1afd76f', '2ee6f4d', 'e58b8b6']);
+        seedActiveCi('detain/phlix-server', ['1afd76f', '2ee6f4d', 'e58b8b6']);
+        const shaTagged = pkgEnv(`${ FULL_SHA }-intel`);
+        const r1 = await attachPackageCommit(shaTagged);
+        assert.equal(r1.attached, true);
+        assert.equal(r1.source, 'tag');
+        assert.equal(shaTagged.extra.dedup_key, 'github:commit:1afd76f');
+        // Overlapping CI would block the active_ci guess; the digest link wins.
+        const floating = pkgEnv('intel');
+        const r2 = await attachPackageCommit(floating);
+        assert.equal(r2.attached, true);
+        assert.equal(r2.source, 'digest_index');
+        assert.equal(floating.extra.dedup_key, 'github:commit:1afd76f');
+    });
+
+    it('falls back to the recent SHA-tagged sibling for buildcache tags (unique digest)', async () => {
+        const { attachPackageSibling, shouldDeferPackage, PKG_DEFER_MS } = consumer;
+        seedLiveCommits(['1afd76f', '2ee6f4d']);
+        seedActiveCi('detain/phlix-server', ['1afd76f', '2ee6f4d']);
+        await attachPackageCommit(pkgEnv(`${ FULL_SHA }-intel`));
+
+        const cache = pkgEnv('buildcache-intel', { digest: 'sha256:' + 'cd'.repeat(32) });
+        const miss = await attachPackageCommit(cache);
+        assert.equal(miss.attached, false);
+        assert.equal(miss.reason, 'no_commit_tag');
+        assert.equal(shouldDeferPackage(cache, miss), true, 'waits for a digest link first');
+
+        cache.extra._pkg_defer_since = Date.now() - PKG_DEFER_MS - 1;
+        assert.equal(shouldDeferPackage(cache, miss), false);
+        const sib = await attachPackageSibling(cache);
+        assert.equal(sib.attached, true);
+        assert.equal(sib.source, 'recent_sibling');
+        assert.equal(cache.extra.dedup_key, 'github:commit:1afd76f');
+        assert.equal(cache.extra._commit_sha, '1afd76f');
+    });
+
+    it('sibling fallback picks the most recent live link and ignores stale or other packages', async () => {
+        const { attachPackageSibling, recordPackageSha, PKG_SIBLING_MS } = consumer;
+        const now = Date.now();
+        seedLiveCommits(['2ee6f4d', '1afd76f']);
+        await recordPackageSha('phlix-hub', '2ee6f4d', now - 120_000);
+        await recordPackageSha('phlix-hub', '1afd76f', now - 10_000);
+        const cache = pkgEnv('buildcache');
+        assert.equal((await attachPackageSibling(cache)).sha, '1afd76f');
+
+        // Most recent link has no live trackable in this room → next one.
+        seedLiveCommits(['2ee6f4d']);
+        assert.equal((await attachPackageSibling(pkgEnv('buildcache'))).sha, '2ee6f4d');
+
+        // Links older than the window and links for other packages never count.
+        redisMock._zsets.clear();
+        seedLiveCommits(['1afd76f']);
+        redisMock._zsets.set(consumer.pkgShaKey('phlix-hub'), new Map([['1afd76f', now - PKG_SIBLING_MS - 1000]]));
+        await recordPackageSha('phlix-base', '1afd76f', now);
+        const stale = await attachPackageSibling(pkgEnv('buildcache'));
+        assert.equal(stale.attached, false);
+        assert.equal(stale.reason, 'no_recent_sibling');
     });
 
     it('gives each image reference + action its own bullet identity', () => {
