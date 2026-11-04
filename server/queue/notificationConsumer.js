@@ -435,6 +435,7 @@ const RELEASE_ACTION_WORDS = {
 function releaseActionVerb(action) {
     const word = String(action || '').trim();
     if (Object.hasOwn(RELEASE_ACTION_WORDS, word)) return RELEASE_ACTION_WORDS[word];
+    // No producer verb to diverge from here: buildPackageText's 'published' default is package-only; GitHub always sends action.
     return word || 'updated';
 }
 
@@ -511,6 +512,7 @@ const PACKAGE_ACTION_WORDS = {
 function packageActionVerb(action) {
     const word = String(action || '').trim();
     if (Object.hasOwn(PACKAGE_ACTION_WORDS, word)) return PACKAGE_ACTION_WORDS[word];
+    // Producer (GithubMessageBuilder buildPackageText) defaults a missing action to 'published' — cosmetic divergence; GitHub always sends action.
     return word || 'updated';
 }
 
@@ -821,6 +823,8 @@ function normalizeGithubDedup(it) {
                 40
             );
             const target = version || 'latest';
+            // Producer key advisory only; this bot-side derivation is authoritative for
+            // coalescing (underscore-stripping & __stripped can differ; inert, bot key wins).
             extra.dedup_key = `github:package:${ repo }:${ name }:${ target }`;
             extra._commit_sha = `package:${ repo }:${ name }:${ target }`;
         }
