@@ -62,6 +62,14 @@ const COMMIT_COLLAPSE_COUNT = (() => {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 15;
 })();
 
+// A nested push bullet (e.g. a downstream split-push nested under the
+// top-level commit) carrying more commit sub-bullets than this renders
+// them as one indented comma-separated hash-link line instead.
+const NESTED_COMMIT_COLLAPSE_COUNT = (() => {
+    const parsed = parseInt(process.env.NOTIF_NESTED_COMMIT_COLLAPSE_COUNT || '', 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
+})();
+
 // Package bullets sharing a verb (published/updated/deleted) fold into one
 // `📦 Published packages (N):` sub-group once there are at least this many;
 // above PACKAGE_LIST_INLINE_MAX the sub-group's entries go on one comma-
@@ -1502,11 +1510,24 @@ function indentAsBullet(messageText) {
         .map(l => l.trim())
         .filter(l => l.length > 0);
     if (lines.length === 0) return bulletPrefix(1);
+    // A nested push listing more than NESTED_COMMIT_COLLAPSE_COUNT commit
+    // sub-bullets folds them into one level-2 `Commits: [sha7](url), …`
+    // line at the first commit's position, keeping every link.
+    const subCommits = lines
+        .map(l => l.match(/^[•*-]\s+(.+)/))
+        .filter(m => m && isCommitBullet(m[1]) && commitLinkOf(m[1]));
+    const collapseSub = subCommits.length > NESTED_COMMIT_COLLAPSE_COUNT;
     const out = [];
     let firstHandled = false;
+    let subCollapsed = false;
     for (const line of lines) {
         const m = line.match(/^[•*-]\s+(.+)/);
-        if (m) {
+        if (m && collapseSub && isCommitBullet(m[1]) && commitLinkOf(m[1])) {
+            if (!subCollapsed) {
+                subCollapsed = true;
+                out.push(bulletPrefix(2) + `Commits: ${ subCommits.map(sm => commitLinkOf(sm[1])).join(', ') }`);
+            }
+        } else if (m) {
             out.push(bulletPrefix(2) + m[1]);
         } else if (!firstHandled) {
             out.push(bulletPrefix(1) + line);
@@ -3552,5 +3573,5 @@ module.exports = {
     shouldDeferPackage, deferPackageItem, PKG_DEFER_MS, PKG_ACTIVE_CI_MS, soleActiveCommit, shaRepoKey, pkgRepoKey,
     attachPackageSibling, recordPackageSha, pkgShaKey, PKG_SIBLING_MS,
     renderTrackable, isCommitBullet, collapseCommitBullets, parsePackageBullet, PACKAGE_GROUP_MIN, PACKAGE_LIST_INLINE_MAX,
-    COMMIT_COLLAPSE_COUNT
+    COMMIT_COLLAPSE_COUNT, NESTED_COMMIT_COLLAPSE_COUNT, indentAsBullet
 };

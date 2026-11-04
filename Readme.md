@@ -331,6 +331,7 @@ This release adds a Redis-backed notification queue consumer, a daily recap Adap
 | `RATE_LIMIT_SEND_MAX` | `30` | Send-endpoint rate limit max reqs |
 | `NOTIF_COMMIT_GROUP_WINDOW_MS` | `180000` (3 min) | GitHub commit grouping window |
 | `NOTIF_COMMIT_COLLAPSE_COUNT` | `15` | Commit bullets above this count collapse into one comma-separated hash-link line |
+| `NOTIF_NESTED_COMMIT_COLLAPSE_COUNT` | `5` | A nested push (e.g. a downstream split-push under its parent commit) with more commit sub-bullets than this collapses them into one indented hash-link line |
 | `NOTIF_DOWNSTREAM_REPOS` | `detain/sugarcraft:sugarcraft/*` | Comma-separated `upstream:glob` pairs. Pushes to a repo matching `glob` are treated as action-triggered and attributed to the most recent active-CI parent in `upstream` |
 
 **GitHub Commit + Job Grouping**

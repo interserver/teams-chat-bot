@@ -5,7 +5,8 @@ const { execFileSync } = require('node:child_process');
 const { activityBytes, MAX_ACTIVITY_BYTES } = require('../server/lib/messageSize');
 const {
     mergeGithubTrackable, parseDownstreamMap, isActionTriggeredPush, normalizeGithubDedup,
-    NOTIF_PR_BRANCH_TTL_MS, renderTrackable, isCommitBullet, collapseCommitBullets, parsePackageBullet
+    NOTIF_PR_BRANCH_TTL_MS, renderTrackable, isCommitBullet, collapseCommitBullets, parsePackageBullet,
+    NESTED_COMMIT_COLLAPSE_COUNT, indentAsBullet
 } = require('../server/queue/notificationConsumer');
 
 // The renderer uses regular Markdown nested bullets (ASCII spaces) when
@@ -1003,6 +1004,49 @@ describe('renderTrackable — commit collapse', () => {
         const result = JSON.parse(stdout.trim().split('\n').pop());
         assert.equal(result.count, 3, 'env override parsed');
         assert.equal(result.collapsed, true, '5 items collapse at threshold 3');
+    });
+});
+
+describe('renderTrackable — nested push commit collapse', () => {
+    const nestedPush = (n) => {
+        const subs = Array.from({ length: n }, (_, i) => {
+            const sha = (i + 0xa0).toString(16).padStart(7, '0');
+            return `• [${ sha }](https://github.com/sugarcraft/x/commit/${ sha }) _msg ${ i }_ _(~1 files)_`;
+        });
+        return { identity: null, text: `📦 Joe pushed ${ n } commits to [sugarcraft/x](https://github.com/sugarcraft/x)\n\n${ subs.join('\n') }` };
+    };
+
+    it('keeps up to NESTED_COMMIT_COLLAPSE_COUNT nested commits expanded', () => {
+        assert.equal(NESTED_COMMIT_COLLAPSE_COUNT, 5);
+        const out = renderTrackable('hdr', [nestedPush(5)]);
+        assert.ok(!out.includes('Commits:'), out);
+        assert.ok(out.includes('_msg 4_'), out);
+        assert.equal(out.split('\n').length, 7, 'header + push bullet + 5 sub-bullets');
+    });
+
+    it('collapses more than 5 nested commits into one indented hash-link line', () => {
+        const out = renderTrackable('hdr', [{ identity: null, text: '🔄 CI Workflow in_progress' }, nestedPush(7)]);
+        const lines = out.split('\n');
+        assert.equal(lines.length, 4, 'header + workflow + push bullet + collapsed line');
+        assert.ok(lines[2].startsWith('- 📦 Joe pushed 7 commits'), lines[2]);
+        assert.ok(lines[3].startsWith('  - Commits: [00000a0](https://github.com/sugarcraft/x/commit/00000a0), '), lines[3]);
+        assert.equal((lines[3].match(/\]\(https:\/\/github\.com\/sugarcraft\/x\/commit\//g) || []).length, 7, 'all 7 links kept');
+        assert.ok(!out.includes('_msg'), 'per-commit messages dropped');
+    });
+
+    it('keeps non-commit sub-bullets of a collapsed nested push', () => {
+        const item = nestedPush(6);
+        item.text += '\n• plain prose sub-bullet';
+        const lines = indentAsBullet(item.text).split('\n');
+        assert.equal(lines.length, 3);
+        assert.ok(lines[1].includes('Commits: '), lines[1]);
+        assert.ok(lines[2].endsWith('- plain prose sub-bullet'), lines[2]);
+    });
+
+    it('does not affect top-level commit bullets (separate threshold)', () => {
+        const items = Array.from({ length: 8 }, (_, i) => commitItem(i));
+        const out = renderTrackable('hdr', items);
+        assert.ok(!out.includes('Commits:'), 'top-level stays expanded below COMMIT_COLLAPSE_COUNT');
     });
 });
 
