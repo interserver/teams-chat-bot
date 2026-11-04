@@ -46,7 +46,7 @@ Every `server/commands/*.js` exports `{ match, execute }`. `deps` = `{ context, 
 Never `new BotFrameworkAdapter(...)` outside `server/lib/adapter.js`. Wrap every outbound Bot Framework call in `runWithRetry(fn, { label, serviceUrl, maxRetries })`. Size-check it first with `activityBytes()` from `server/lib/messageSize.js` — Teams rejects activities over ~25 KB serialized and `onTurnError` swallows the `Message size too large` error, so an oversized send looks successful while nothing lands.
 
 ### Notification envelopes
-`notif:queue` JSON envelopes: `{ room, text|attachments, extra?: { dedup_key }, fallback_webhook_url? }`. `extra.dedup_key` enables edit-window coalescing (`NOTIF_EDIT_WINDOW_MS`, 30 min). GitHub commit events auto-get `dedup_key=github:commit:{sha7}`. Oversized activities are trimmed/truncated by `guardActivity()`; oversized coalesced text is split by `splitTextIntoChunks()`.
+`notif:queue` JSON envelopes: `{ room, text|attachments, extra?: { dedup_key }, fallback_webhook_url? }`. `extra.dedup_key` enables edit-window coalescing (`NOTIF_EDIT_WINDOW_MS`, 30 min). GitHub commit events auto-get `dedup_key=github:commit:{sha7}`; `release` stubs are rewritten by `describeReleaseEvent()`, and commit bullets collapse into one hash-link line (`collapseCommitBullets()`) above `NOTIF_COMMIT_COLLAPSE_COUNT` (15) or when the expanded render exceeds `MAX_ACTIVITY_BYTES`. Oversized activities are trimmed/truncated by `guardActivity()`; oversized coalesced text is split by `splitTextIntoChunks()`.
 
 ### Channel routing
 Always `resolve(roomName)` from `server/queue/channels.js`. Never hardcode `19:*@thread.v2` IDs.
