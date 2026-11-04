@@ -835,6 +835,12 @@ describe('attachPackageCommit — nest SHA-tagged images under their commit', ()
         redisMock = makeRedisMock();
         redisMock._hashes = new Map();
         redisMock.hget = async (key, field) => redisMock._hashes.get(key)?.get(field) ?? null;
+        // Sorted sets: key → Map(member → score); honours the min-score cutoff.
+        redisMock._zsets = new Map();
+        redisMock.zrevrangebyscore = async (key, _max, min) => [...(redisMock._zsets.get(key) || new Map())]
+            .filter(([, score]) => score >= min)
+            .sort((a, b) => b[1] - a[1])
+            .map(([member]) => member);
         originals = _setInternalsForTest({ redis: redisMock });
     });
     after(() => {
@@ -843,7 +849,18 @@ describe('attachPackageCommit — nest SHA-tagged images under their commit', ()
     beforeEach(() => {
         redisMock._kv.clear();
         redisMock._hashes.clear();
+        redisMock._zsets.clear();
     });
+
+    function seedLiveCommits(shas, room = ROOM) {
+        redisMock._hashes.set(`notif:recent:${ room }`, new Map(shas.map(sha => [
+            `github:commit:${ sha }`,
+            JSON.stringify({ activityId: `act-${ sha }`, ts: Date.now() - 60_000, type: 'msg' })
+        ])));
+    }
+    function seedActiveCi(repo, shas, ageMs = 60_000) {
+        redisMock._zsets.set(`notif:wfactive:${ repo }`, new Map(shas.map((sha, i) => [sha, Date.now() - ageMs - i])));
+    }
 
     it('treats only 7–40 hex tags as commit SHAs', () => {
         assert.equal(commitShaFromTag('f2c9cc915d8b'), 'f2c9cc9');
@@ -915,6 +932,111 @@ describe('attachPackageCommit — nest SHA-tagged images under their commit', ()
     it('ignores non-package events and stripped payloads', async () => {
         assert.deepEqual(await attachPackageCommit({ extra: { event_type: 'push', data: {} } }), { attached: false });
         assert.deepEqual(await attachPackageCommit({ extra: { event_type: 'registry_package', data: { __stripped: true } } }), { attached: false });
+    });
+
+    it('attaches an early `latest` to the single commit with CI running in the package repo', async () => {
+        seedLiveCommits(['32cbd66']);
+        seedActiveCi('detain/phlix-server', ['32cbd66']);
+        const latest = pkgEnv('latest');
+        const result = await attachPackageCommit(latest);
+        assert.equal(result.attached, true);
+        assert.equal(result.source, 'active_ci');
+        assert.equal(latest.extra.dedup_key, 'github:commit:32cbd66');
+    });
+
+    it('does not guess when several commits have CI running (falls back to waiting)', async () => {
+        const { shouldDeferPackage } = consumer;
+        seedLiveCommits(['bf49678', 'f2c9cc9']);
+        seedActiveCi('detain/phlix-server', ['bf49678', 'f2c9cc9']);
+        const latest = pkgEnv('latest');
+        const result = await attachPackageCommit(latest);
+        assert.equal(result.attached, false);
+        assert.equal(result.reason, 'no_commit_tag');
+        assert.equal(result.candidates, 2);
+        assert.equal(shouldDeferPackage(latest, result), true);
+    });
+
+    it('ignores active-CI commits without a live trackable in the room, or with stale CI', async () => {
+        seedLiveCommits(['32cbd66'], 'notifications');
+        seedActiveCi('detain/phlix-server', ['32cbd66']);
+        assert.equal((await attachPackageCommit(pkgEnv('latest'))).candidates, 0);
+        seedLiveCommits(['32cbd66']);
+        seedActiveCi('detain/phlix-server', ['32cbd66'], consumer.PKG_ACTIVE_CI_MS + 60_000);
+        assert.equal((await attachPackageCommit(pkgEnv('latest'))).attached, false);
+    });
+
+    it('learns the builder repo from a SHA-tagged publish and uses it for later floating tags', async () => {
+        // phlix-hub images are filed under phlix-server but built by phlix-hub's CI.
+        await redisMock.set(consumer.shaRepoKey('f2c9cc9'), 'detain/phlix-hub', 'PX', 60_000);
+        seedLiveCommits(['f2c9cc9', '58530ec']);
+        await attachPackageCommit(pkgEnv('f2c9cc915d8b'));
+        assert.equal(await redisMock.get(consumer.pkgRepoKey('phlix-hub')), 'detain/phlix-hub');
+
+        // Next build: phlix-server also has CI running, but only phlix-hub's commit counts.
+        seedLiveCommits(['54cbf32', '58530ec']);
+        seedActiveCi('detain/phlix-server', ['58530ec']);
+        seedActiveCi('detain/phlix-hub', ['54cbf32']);
+        const latest = pkgEnv('latest', { digest: 'sha256:' + 'ab'.repeat(32) });
+        const result = await attachPackageCommit(latest);
+        assert.equal(result.attached, true);
+        assert.equal(result.source, 'active_ci');
+        assert.equal(latest.extra.dedup_key, 'github:commit:54cbf32');
+    });
+
+    it('recordActiveWorkflow seeds the sha → repo index', async () => {
+        redisMock.pipeline = () => {
+            const chain = { zadd() { return chain; }, zremrangebyscore() { return chain; }, expire() { return chain; }, async exec() { return []; } };
+            return chain;
+        };
+        await consumer.recordActiveWorkflow({ extra: { event_type: 'workflow_job', repo: 'detain/phlix-hub', _commit_sha: 'f2c9cc9' } });
+        assert.equal(await redisMock.get(consumer.shaRepoKey('f2c9cc9')), 'detain/phlix-hub');
+        delete redisMock.pipeline;
+    });
+
+    it('defers an unlinked floating tag until PKG_DEFER_MS has passed', () => {
+        const { shouldDeferPackage, PKG_DEFER_MS } = consumer;
+        const miss = { attached: false, reason: 'no_commit_tag' };
+        const latest = pkgEnv('latest');
+        assert.equal(shouldDeferPackage(latest, miss), true);
+        latest.extra._pkg_defer_since = Date.now() - PKG_DEFER_MS - 1;
+        assert.equal(shouldDeferPackage(latest, miss), false, 'gives up after the window');
+        // Never defer: SHA tags, linked items, a missing commit trackable, no digest.
+        assert.equal(shouldDeferPackage(pkgEnv('f2c9cc915d8b'), miss), false);
+        assert.equal(shouldDeferPackage(pkgEnv('latest'), { attached: true }), false);
+        assert.equal(shouldDeferPackage(pkgEnv('latest'), { attached: false, reason: 'no_live_commit_trackable' }), false);
+        assert.equal(shouldDeferPackage(pkgEnv('latest', { digest: 'not-a-digest' }), miss), false);
+        assert.equal(shouldDeferPackage({ extra: { event_type: 'push', data: {} } }, miss), false);
+    });
+
+    it('re-queues the original envelope with a defer stamp and drops the processing copy', async () => {
+        const { deferPackageItem } = consumer;
+        const ops = [];
+        redisMock.multi = () => {
+            const chain = {
+                lpush(key, value) { ops.push(['lpush', key, value]); return chain; },
+                lrem(key, count, value) { ops.push(['lrem', key, count, value]); return chain; },
+                async exec() { return []; }
+            };
+            return chain;
+        };
+        const original = pkgEnv('latest');
+        const raw = JSON.stringify(original);
+        // Routing mutations on it.env must NOT leak into the re-queued copy.
+        const mutated = JSON.parse(raw);
+        mutated.room = 'mutated-room';
+        assert.equal(await deferPackageItem({ raw, env: mutated }, 1000), true);
+        assert.equal(ops[0][0], 'lpush');
+        assert.equal(ops[0][1], 'notif:queue');
+        const requeued = JSON.parse(ops[0][2]);
+        assert.equal(requeued.room, ROOM);
+        assert.equal(requeued.extra._pkg_defer_since, 1000);
+        assert.deepEqual(ops[1], ['lrem', 'notif:processing', 1, raw]);
+
+        // A second deferral keeps the first stamp so the wait stays capped.
+        ops.length = 0;
+        await deferPackageItem({ raw: ops[0]?.[2] || JSON.stringify(requeued), env: requeued }, 9000);
+        assert.equal(JSON.parse(ops[0][2]).extra._pkg_defer_since, 1000);
+        delete redisMock.multi;
     });
 
     it('gives each image reference + action its own bullet identity', () => {

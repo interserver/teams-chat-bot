@@ -37,6 +37,15 @@ const COALESCE_MAX_ITEMS = parseInt(process.env.NOTIF_COALESCE_MAX_ITEMS || '8',
 const EDIT_WINDOW_MS = parseInt(process.env.NOTIF_EDIT_WINDOW_MS || String(30 * 60 * 1000), 10);
 const NOTIF_PR_BRANCH_TTL_MS = parseInt(process.env.NOTIF_PR_BRANCH_TTL_MS || String(24 * 60 * 60 * 1000), 10);
 const KEY_PREFIX = process.env.NOTIF_KEY_PREFIX || 'notif:';
+// Max time a floating-tag container publish (`latest`) waits in the queue
+// for its SHA-tagged sibling to link the image digest to a commit.
+const PKG_DEFER_MS = parseInt(process.env.NOTIF_PKG_DEFER_MS || '15000', 10);
+// How recently a commit must have had CI activity to count as "running"
+// when guessing which commit a floating-tag (`latest`) publish belongs to.
+// Docker steps can run several minutes without emitting a workflow event.
+const PKG_ACTIVE_CI_MS = parseInt(process.env.NOTIF_PKG_ACTIVE_CI_MS || String(10 * 60 * 1000), 10);
+// How long a learned package → builder-repo mapping is kept.
+const PKG_REPO_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const HEARTBEAT_MS = parseInt(process.env.NOTIF_HEARTBEAT_MS || '60000', 10);
 const APPEND_BREAK = '\n\n— · —\n\n';
 const APPEND_TRAIL_SUMMARY_AFTER = 3;
@@ -140,6 +149,12 @@ function prBranchKey(repo, branch) { return k('prbranch:') + repo + ':' + branch
 // seeded by SHA-tagged image publishes so the `latest` tag of the same
 // digest can find the commit it was built from. TTL = EDIT_WINDOW_MS.
 function pkgDigestKey(name, digest) { return k('pkgdigest:') + name + ':' + digest; }
+// sha7 → repo whose CI produced it (seeded by recordActiveWorkflow), and
+// package name → repo whose CI builds it (learned from SHA-tagged publishes).
+// Images are filed under whichever repo their source label names, which is
+// not always the repo that builds them (phlix-hub is filed under phlix-server).
+function shaRepoKey(sha) { return k('sharepo:') + sha; }
+function pkgRepoKey(name) { return k('pkgrepo:') + name; }
 
 // ---------------------------------------------------------------------------
 // Action-triggered push attribution
@@ -255,6 +270,11 @@ async function recordActiveWorkflow(env) {
         await pipe.exec();
     } catch (err) {
         console.warn(`[notif] recordActiveWorkflow failed for ${ repo }/${ sha }: ${ err.message }`);
+    }
+    try {
+        await redis.set(shaRepoKey(sha), repo, 'PX', EDIT_WINDOW_MS);
+    } catch (err) {
+        console.warn(`[notif] sharepo record failed for ${ repo }/${ sha }: ${ err.message }`);
     }
 }
 
@@ -682,13 +702,101 @@ function collectTickPackageShas(items) {
     return out;
 }
 
+/** True when `github:commit:{sha}` has a live trackable in `room`. */
+async function isLiveCommitTrackable(room, sha) {
+    try {
+        const raw = await redis.hget(recentKey(room), `github:commit:${ sha }`);
+        if (!raw) return false;
+        const recent = JSON.parse(raw);
+        return Boolean(recent && recent.activityId && Date.now() - recent.ts < EDIT_WINDOW_MS);
+    } catch (err) {
+        console.warn(`[notif] package commit lookup failed for ${ sha }: ${ err.message }`);
+        return false;
+    }
+}
+
+/**
+ * Best guess for a floating-tag publish that no digest links yet: the commit
+ * with CI running in the repo that builds this image (learned builder repo,
+ * else the repo the package is filed under), restricted to commits with a
+ * live trackable in this room. Only an unambiguous single candidate counts —
+ * overlapping builds (several commits in flight) return `sha: null` so the
+ * caller waits for the SHA-tagged sibling instead of guessing wrong.
+ */
+async function soleActiveCommit(name, pkgRepo, room) {
+    let builderRepo = pkgRepo || '';
+    try {
+        builderRepo = (await redis.get(pkgRepoKey(name))) || builderRepo;
+    } catch (_) { /* fall back to the package repo */ }
+    if (!builderRepo) return { sha: null, builderRepo, candidates: 0 };
+    let members = [];
+    try {
+        members = await redis.zrevrangebyscore(
+            wfactiveKey(builderRepo), '+inf', Date.now() - PKG_ACTIVE_CI_MS, 'LIMIT', 0, 10
+        );
+    } catch (err) {
+        console.warn(`[notif] active-CI lookup failed for ${ builderRepo }: ${ err.message }`);
+    }
+    const live = [];
+    for (const sha of members || []) {
+        if (await isLiveCommitTrackable(room, sha)) live.push(sha);
+    }
+    return { sha: live.length === 1 ? live[0] : null, builderRepo, candidates: live.length };
+}
+
+/**
+ * Should this unlinked container publish wait for its SHA-tagged sibling?
+ * GitHub delivers one event per tag of the same digest in no fixed order;
+ * when `latest` lands a tick before `:<sha>`, nothing maps the digest to a
+ * commit yet. Only floating tags with a digest qualify, and only until
+ * PKG_DEFER_MS has passed since the first deferral (`extra._pkg_defer_since`).
+ */
+function shouldDeferPackage(env, pkgCommit, now = Date.now()) {
+    if (PKG_DEFER_MS <= 0) return false;
+    if (!pkgCommit || pkgCommit.attached || pkgCommit.reason !== 'no_commit_tag') return false;
+    const ref = containerPackageRef(env);
+    if (!ref || !ref.digest || !ref.tag || commitShaFromTag(ref.tag)) return false;
+    const since = Number(env.extra?._pkg_defer_since) || now;
+    return now - since < PKG_DEFER_MS;
+}
+
+/**
+ * Put an item back at the tail of the queue (LPUSH — the consumer pops the
+ * other end), stamped with when its deferral started, and drop the
+ * processing copy. Re-pushes the ORIGINAL raw envelope plus the stamp so
+ * the next tick re-runs routing/normalisation from scratch.
+ */
+async function deferPackageItem(it, now = Date.now()) {
+    let original;
+    try {
+        original = JSON.parse(it.raw);
+    } catch (_) {
+        return false;
+    }
+    original.extra = original.extra || {};
+    if (!original.extra._pkg_defer_since) original.extra._pkg_defer_since = now;
+    try {
+        await redis.multi()
+            .lpush(k('queue'), JSON.stringify(original))
+            .lrem(k('processing'), 1, it.raw)
+            .exec();
+        return true;
+    } catch (err) {
+        console.warn(`[notif] package defer failed, sending now: ${ err.message }`);
+        return false;
+    }
+}
+
 /**
  * Re-key a container package publish onto the commit trackable it was built
  * from. Mutates `env.extra.dedup_key` / `_commit_sha` only when the target
  * `github:commit:{sha7}` trackable is live (within EDIT_WINDOW_MS) in this
  * envelope's room — otherwise the package keeps its own trackable, so a
  * hex-looking version tag with no matching commit never spawns a bogus
- * commit message. Returns a trace descriptor.
+ * commit message. Resolution order: SHA-shaped tag → same-tick sibling with
+ * the same digest → digest index → the single commit with CI running in the
+ * image's builder repo (`active_ci`; ambiguous overlap returns no link so the
+ * caller can wait for the SHA-tagged sibling). Returns a trace descriptor.
  */
 async function attachPackageCommit(env, tickShas = new Map()) {
     const ref = containerPackageRef(env);
@@ -716,21 +824,32 @@ async function attachPackageCommit(env, tickShas = new Map()) {
             console.warn(`[notif] pkgdigest lookup failed for ${ ref.name }: ${ err.message }`);
         }
     }
-    if (!sha) return { attached: false, reason: 'no_commit_tag', name: ref.name, tag: ref.tag };
-
     const room = env.room || 'notifications';
-    const commitKey = `github:commit:${ sha }`;
-    let live = false;
-    try {
-        const raw = await redis.hget(recentKey(room), commitKey);
-        if (raw) {
-            const recent = JSON.parse(raw);
-            live = Boolean(recent && recent.activityId && Date.now() - recent.ts < EDIT_WINDOW_MS);
+    let candidates;
+    if (!sha && ref.tag && ref.digest) {
+        const guess = await soleActiveCommit(ref.name, extra.repo || '', room);
+        candidates = guess.candidates;
+        if (guess.sha) {
+            sha = guess.sha;
+            source = 'active_ci';
         }
-    } catch (err) {
-        console.warn(`[notif] package commit lookup failed for ${ commitKey }: ${ err.message }`);
     }
-    if (!live) return { attached: false, reason: 'no_live_commit_trackable', name: ref.name, tag: ref.tag, sha, source };
+    if (!sha) return { attached: false, reason: 'no_commit_tag', name: ref.name, tag: ref.tag, candidates };
+
+    if (source === 'tag') {
+        // Learn which repo's CI builds this image, for future floating tags.
+        try {
+            const builderRepo = await redis.get(shaRepoKey(sha));
+            if (builderRepo) await redis.set(pkgRepoKey(ref.name), builderRepo, 'PX', PKG_REPO_TTL_MS);
+        } catch (err) {
+            console.warn(`[notif] pkgrepo learn failed for ${ ref.name }: ${ err.message }`);
+        }
+    }
+
+    const commitKey = `github:commit:${ sha }`;
+    if (!await isLiveCommitTrackable(room, sha)) {
+        return { attached: false, reason: 'no_live_commit_trackable', name: ref.name, tag: ref.tag, sha, source };
+    }
 
     extra._original_dedup_key = extra.dedup_key;
     extra.dedup_key = commitKey;
@@ -2026,7 +2145,7 @@ async function runTick() {
     const t0 = Date.now();
     totalTicks++;
     trace.newTick();
-    const stats = { drained: 0, sent: 0, edited: 0, coalesced: 0, fallback: 0, dead: 0, expired: 0, redirected: 0 };
+    const stats = { drained: 0, sent: 0, edited: 0, coalesced: 0, fallback: 0, dead: 0, expired: 0, redirected: 0, deferred: 0 };
     try {
         // Recover anything left over from a prior crashed tick BEFORE we drain new items.
         if (firstTick) {
@@ -2194,6 +2313,18 @@ async function runTick() {
             // Container image publishes tagged with a commit SHA nest under
             // that commit's live trackable instead of posting on their own.
             const pkgCommit = await attachPackageCommit(it.env, tickPackageShas);
+            if (shouldDeferPackage(it.env, pkgCommit) && await deferPackageItem(it)) {
+                trace.emit('package_deferred', {
+                    room: it.env.room,
+                    name: pkgCommit.name,
+                    tag: pkgCommit.tag,
+                    active_ci_candidates: pkgCommit.candidates ?? null,
+                    waited_ms: it.env.extra?._pkg_defer_since ? Date.now() - it.env.extra._pkg_defer_since : 0,
+                    max_wait_ms: PKG_DEFER_MS
+                });
+                stats.deferred++;
+                continue;
+            }
             if (pkgCommit.attached) {
                 console.log(`[notif]   ↳ nesting package ${ pkgCommit.name }:${ pkgCommit.tag || '(digest)' } under commit ${ pkgCommit.sha } (${ pkgCommit.source })`);
                 trace.emit('package_commit_attached', {
@@ -2263,7 +2394,7 @@ async function runTick() {
         tickInFlight = false;
         const ms = Date.now() - t0;
         if (stats.drained > 0) {
-            console.log(`[notif] tick drained=${ stats.drained } sent=${ stats.sent } edited=${ stats.edited } coalesced=${ stats.coalesced } redirected=${ stats.redirected } fallback=${ stats.fallback } dead=${ stats.dead } expired=${ stats.expired } ms=${ ms }`);
+            console.log(`[notif] tick drained=${ stats.drained } sent=${ stats.sent } edited=${ stats.edited } coalesced=${ stats.coalesced } redirected=${ stats.redirected } fallback=${ stats.fallback } dead=${ stats.dead } expired=${ stats.expired } deferred=${ stats.deferred } ms=${ ms }`);
             trace.emit('tick_end', { stats: { ...stats }, ms });
             scheduleNextTick(POLL_INTERVAL_FAST_MS);
         } else {
@@ -3277,6 +3408,7 @@ module.exports = {
     // release + package rendering helpers (also used by tests)
     describeReleaseEvent, describePackageEvent, packageLabel, packageUrl, condensedBulletText,
     containerPackageRef, commitShaFromTag, collectTickPackageShas, attachPackageCommit, pkgDigestKey, jobIdentity,
+    shouldDeferPackage, deferPackageItem, PKG_DEFER_MS, PKG_ACTIVE_CI_MS, soleActiveCommit, shaRepoKey, pkgRepoKey,
     renderTrackable, isCommitBullet, collapseCommitBullets,
     COMMIT_COLLAPSE_COUNT
 };
