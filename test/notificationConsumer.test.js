@@ -5,7 +5,7 @@ const { execFileSync } = require('node:child_process');
 const { activityBytes, MAX_ACTIVITY_BYTES } = require('../server/lib/messageSize');
 const {
     mergeGithubTrackable, parseDownstreamMap, isActionTriggeredPush, normalizeGithubDedup,
-    NOTIF_PR_BRANCH_TTL_MS, renderTrackable, isCommitBullet, collapseCommitBullets
+    NOTIF_PR_BRANCH_TTL_MS, renderTrackable, isCommitBullet, collapseCommitBullets, parsePackageBullet
 } = require('../server/queue/notificationConsumer');
 
 // The renderer uses regular Markdown nested bullets (ASCII spaces) when
@@ -1003,5 +1003,76 @@ describe('renderTrackable — commit collapse', () => {
         const result = JSON.parse(stdout.trim().split('\n').pop());
         assert.equal(result.count, 3, 'env override parsed');
         assert.equal(result.collapsed, true, '5 items collapse at threshold 3');
+    });
+});
+
+describe('renderTrackable — package sub-group', () => {
+    const pkgItem = (tag, verb = 'published') => ({
+        identity: `package:phlix-server:${ tag }:${ verb }`,
+        text: `📦 [**phlix-server:${ tag }**](https://github.com/users/detain/packages/container/phlix-server/${ tag }) — ${ verb }`
+    });
+
+    it('parses condensed package bullets, linked and unlinked', () => {
+        assert.deepEqual(parsePackageBullet(pkgItem('intel')), {
+            label: 'phlix-server:intel',
+            url: 'https://github.com/users/detain/packages/container/phlix-server/intel',
+            verb: 'published',
+            linked: '[**phlix-server:intel**](https://github.com/users/detain/packages/container/phlix-server/intel)'
+        });
+        const bare = parsePackageBullet({ identity: 'package:solo::updated', text: '📦 **solo** — updated' });
+        assert.equal(bare.label, 'solo');
+        assert.equal(bare.url, null);
+        assert.equal(bare.verb, 'updated');
+        assert.equal(parsePackageBullet({ identity: null, text: '📦 [**x**](u) — published' }), null, 'identity gates');
+    });
+
+    it('keeps fewer than 3 packages as plain bullets', () => {
+        const out = renderTrackable('hdr', [pkgItem('a'), pkgItem('b')]);
+        assert.ok(!out.includes('packages ('), out);
+        assert.ok(out.includes(L1 + '📦 [**phlix-server:a**]'), out);
+        assert.ok(out.includes('— published'), out);
+    });
+
+    it('folds 3+ packages into a sub-group without per-item verbs', () => {
+        const items = [
+            { identity: null, text: 'ℹ️ before' },
+            pkgItem('a'),
+            { identity: null, text: 'ℹ️ between' },
+            pkgItem('b'),
+            pkgItem('c')
+        ];
+        const lines = renderTrackable('hdr', items).split('\n');
+        assert.deepEqual(lines, [
+            'hdr',
+            L1 + 'ℹ️ before',
+            L1 + '📦 Published packages (3):',
+            L2_SHALLOW + '[**phlix-server:a**](https://github.com/users/detain/packages/container/phlix-server/a)',
+            L2_SHALLOW + '[**phlix-server:b**](https://github.com/users/detain/packages/container/phlix-server/b)',
+            L2_SHALLOW + '[**phlix-server:c**](https://github.com/users/detain/packages/container/phlix-server/c)',
+            L1 + 'ℹ️ between'
+        ]);
+    });
+
+    it('switches to one comma-separated line above 10 packages', () => {
+        const items = Array.from({ length: 12 }, (_, i) => pkgItem('t' + i));
+        const lines = renderTrackable('hdr', items).split('\n');
+        assert.equal(lines.length, 3, lines.join('\n'));
+        assert.equal(lines[1], L1 + '📦 Published packages (12):');
+        assert.ok(lines[2].startsWith(L2_SHALLOW + '[phlix-server:t0](https://'), lines[2]);
+        assert.equal(lines[2].split('), [').length, 12, 'all 12 links on one line');
+        assert.ok(!lines[2].includes('published'), 'no per-item verb');
+    });
+
+    it('exactly 10 packages still render as bullets', () => {
+        const items = Array.from({ length: 10 }, (_, i) => pkgItem('t' + i));
+        assert.equal(renderTrackable('hdr', items).split('\n').length, 12);
+    });
+
+    it('groups per verb; a verb under the threshold keeps its own bullets', () => {
+        const items = [pkgItem('a'), pkgItem('b'), pkgItem('c'), pkgItem('d', 'deleted')];
+        const out = renderTrackable('hdr', items);
+        assert.ok(out.includes(L1 + '📦 Published packages (3):'), out);
+        assert.ok(out.includes(L1 + '📦 [**phlix-server:d**]'), out);
+        assert.ok(out.includes('— deleted'), out);
     });
 });

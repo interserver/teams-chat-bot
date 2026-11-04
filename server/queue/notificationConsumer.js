@@ -62,6 +62,13 @@ const COMMIT_COLLAPSE_COUNT = (() => {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 15;
 })();
 
+// Package bullets sharing a verb (published/updated/deleted) fold into one
+// `📦 Published packages (N):` sub-group once there are at least this many;
+// above PACKAGE_LIST_INLINE_MAX the sub-group's entries go on one comma-
+// separated line instead of one bullet each.
+const PACKAGE_GROUP_MIN = 3;
+const PACKAGE_LIST_INLINE_MAX = 10;
+
 // ---------------------------------------------------------------------------
 // Oversized-activity guard (hard backstop)
 // ---------------------------------------------------------------------------
@@ -1805,6 +1812,42 @@ function collapseCommitBullets(items) {
     return bulletPrefix(1) + `Commits: ${ links.join(', ') }`;
 }
 
+// Condensed package bullet: `📦 [**label**](url) — verb` or `📦 **label** — verb`.
+const PACKAGE_BULLET_RE = /^📦\s+(\[\*\*(.+?)\*\*\]\((\S+?)\)|\*\*(.+?)\*\*)\s+—\s+(\S+)$/u;
+
+/**
+ * Parse a folded package item (identity `package:…`) into its label, link
+ * and verb, or null when the item is not a condensed package bullet.
+ * @param {object} item trackable item record ({ identity, text })
+ */
+function parsePackageBullet(item) {
+    if (!item || !item.identity || !item.identity.startsWith('package:')) return null;
+    const m = String(item.text || '').trim().match(PACKAGE_BULLET_RE);
+    if (!m) return null;
+    const label = m[2] || m[4];
+    return { label, url: m[3] || null, verb: m[5], linked: m[1] };
+}
+
+/**
+ * Render a verb-group of package bullets as a `📦 Published packages (N):`
+ * sub-group: one nested bullet per package, or — above
+ * PACKAGE_LIST_INLINE_MAX — a single nested comma-separated line. The verb
+ * lives in the group title, so the entries drop their `— published` tail.
+ * @param {string} verb shared package action verb
+ * @param {Array} pkgs parsed package bullets ({ label, url, linked })
+ */
+function renderPackageGroup(verb, pkgs) {
+    const title = verb.charAt(0).toUpperCase() + verb.slice(1);
+    const lines = [bulletPrefix(1) + `📦 ${ title } packages (${ pkgs.length }):`];
+    if (pkgs.length > PACKAGE_LIST_INLINE_MAX) {
+        const compact = pkgs.map(p => (p.url ? `[${ p.label }](${ p.url })` : p.label));
+        lines.push(bulletPrefix(2) + compact.join(', '));
+    } else {
+        for (const p of pkgs) lines.push(bulletPrefix(2) + p.linked);
+    }
+    return lines;
+}
+
 /**
  * Render a trackable to its final text. Non-check_run items render as
  * flat top-level bullets in insertion order; check_run items whose name
@@ -1839,12 +1882,31 @@ function renderTrackable(header, items) {
  */
 function renderTrackableBody(header, items, collapseCommits) {
     const headerText = String(header || '').trim();
-    const flatBullets = [];
+    const flatBullets = []; // strings, or { pkgVerb } / { commits } slot tokens
     const checkItems = [];
     const commitItems = [];
     let commitSlot = null; // flatBullets index where the collapsed line belongs
 
+    // Package bullets sharing a verb fold into one sub-group once there are
+    // PACKAGE_GROUP_MIN of them; the group takes the first member's slot.
+    const pkgByVerb = new Map();
     for (const item of items) {
+        const pkg = parsePackageBullet(item);
+        if (!pkg) continue;
+        if (!pkgByVerb.has(pkg.verb)) pkgByVerb.set(pkg.verb, []);
+        pkgByVerb.get(pkg.verb).push(pkg);
+    }
+    const pkgSlotted = new Set();
+
+    for (const item of items) {
+        const pkg = parsePackageBullet(item);
+        if (pkg && pkgByVerb.get(pkg.verb).length >= PACKAGE_GROUP_MIN) {
+            if (!pkgSlotted.has(pkg.verb)) {
+                pkgSlotted.add(pkg.verb);
+                flatBullets.push({ pkgVerb: pkg.verb });
+            }
+            continue;
+        }
         if (item.identity && item.identity.startsWith('check_run:')) {
             const name = item.identity.slice('check_run:'.length);
             const decomp = decomposeCheckSegments(name);
@@ -1881,7 +1943,10 @@ function renderTrackableBody(header, items, collapseCommits) {
 
     const lines = [];
     if (headerText) lines.push(headerText);
-    lines.push(...flatBullets);
+    for (const entry of flatBullets) {
+        if (typeof entry === 'string') lines.push(entry);
+        else lines.push(...renderPackageGroup(entry.pkgVerb, pkgByVerb.get(entry.pkgVerb)));
+    }
     renderChecksGrouped(checkItems, 1, lines);
 
     // A multi-line header (PR/issue description, `> _commit msg_` quote,
@@ -3486,6 +3551,6 @@ module.exports = {
     containerPackageRef, commitShaFromTag, collectTickPackageShas, attachPackageCommit, pkgDigestKey, jobIdentity,
     shouldDeferPackage, deferPackageItem, PKG_DEFER_MS, PKG_ACTIVE_CI_MS, soleActiveCommit, shaRepoKey, pkgRepoKey,
     attachPackageSibling, recordPackageSha, pkgShaKey, PKG_SIBLING_MS,
-    renderTrackable, isCommitBullet, collapseCommitBullets,
+    renderTrackable, isCommitBullet, collapseCommitBullets, parsePackageBullet, PACKAGE_GROUP_MIN, PACKAGE_LIST_INLINE_MAX,
     COMMIT_COLLAPSE_COUNT
 };
