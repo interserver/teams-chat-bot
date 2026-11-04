@@ -446,7 +446,7 @@ function releaseActionVerb(action) {
 function sanitizeReleaseTitle(value) {
     const cleaned = String(value ?? '')
         .replace(/[[\]()*~_+`\\]/g, '')
-        .replace(/\s+/, ' ')
+        .replace(/\s+/g, ' ')
         .trim();
     if (!cleaned) return '';
     const capped = charCut(cleaned, 80);

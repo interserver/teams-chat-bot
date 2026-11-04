@@ -405,6 +405,13 @@ describe('describeReleaseEvent', () => {
         assert.ok(!line.includes('x'.repeat(81)), 'name capped at 80 chars');
     });
 
+    it('collapses every multi-space run in a title, not just the first', () => {
+        const line = describeReleaseEvent({
+            release: { tag_name: 'v1', name: 'Foo   Bar    Baz' }
+        }, 'o/r');
+        assert.ok(line.includes('[**Foo Bar Baz**]'), line);
+    });
+
     it('renders deleted releases with the waste-basket and no dead link', () => {
         const line = describeReleaseEvent({
             action: 'deleted',
