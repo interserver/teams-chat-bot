@@ -530,3 +530,224 @@ describe('condensedBulletText — release branch', () => {
         assert.equal(condensedBulletText({ extra: { event_type: 'release', data: { action: 'edited', release: {} } } }), null);
     });
 });
+
+// ---------------------------------------------------------------------------
+// Package event rendering
+// ---------------------------------------------------------------------------
+
+const PACKAGE_STUB = 'ℹ️ github-actions[bot] triggered a **registry_package** event (edited) on [detain/sugarcraft](https://github.com/detain/sugarcraft).';
+const PACKAGE_STUB_SHORT = 'ℹ️ github-actions[bot] triggered a **package** event on [detain/sugarcraft](https://github.com/detain/sugarcraft).';
+
+describe('describePackageEvent', () => {
+    const { describePackageEvent } = consumer;
+
+    it('describes a published npm package with version link and type note', () => {
+        const line = describePackageEvent({
+            action: 'published',
+            registry_package: {
+                name: '@detain/sugarcraft',
+                package_type: 'npm',
+                package_version: { name: '2.1.0' },
+                html_url: 'https://github.com/orgs/detain/packages/@detain/sugarcraft/2.1.0'
+            }
+        }, 'detain/sugarcraft');
+        assert.equal(line, '📦 published [**@detain/sugarcraft@2.1.0**](https://github.com/orgs/detain/packages/@detain/sugarcraft/2.1.0) (npm) on [detain/sugarcraft](https://github.com/detain/sugarcraft).');
+    });
+
+    it('keeps scoped-name punctuation intact so the link stays balanced', () => {
+        const line = describePackageEvent({
+            action: 'updated',
+            registry_package: { name: '@detain:sugar/craft', package_version: { name: '1.0.0:beta' } }
+        }, 'o/r');
+        assert.ok(line.includes('[**@detain:sugar/craft@1.0.0:beta**]'), line);
+        assert.ok(!/\[[^\]]*\[[^\]]*\]/.test(line), 'no nested brackets in link label');
+    });
+
+    it('omits the version when the payload carries none', () => {
+        const line = describePackageEvent({
+            action: 'published',
+            registry_package: { name: 'sugarcraft' }
+        }, 'o/r');
+        assert.equal(line, '📦 published [**sugarcraft**](https://github.com/o/r/packages) on [o/r](https://github.com/o/r).');
+    });
+
+    it('reads package_version.version and top-level version as fallbacks', () => {
+        const viaVersionField = describePackageEvent({
+            registry_package: { name: 'p', package_version: { version: '3.2.1' } }
+        }, 'o/r');
+        assert.ok(viaVersionField.includes('**p@3.2.1**'), viaVersionField);
+        const viaTopLevel = describePackageEvent({
+            registry_package: { name: 'p', version: '4.5.6' }
+        }, 'o/r');
+        assert.ok(viaTopLevel.includes('**p@4.5.6**'), viaTopLevel);
+    });
+
+    it('maps known package types and lowercases unknown ones', () => {
+        const gems = describePackageEvent({ registry_package: { name: 'g', package_type: 'ruby_gems' } }, 'o/r');
+        assert.ok(gems.includes('(gems)'), gems);
+        const container = describePackageEvent({ registry_package: { name: 'c', package_type: 'CONTAINER_REGISTRY' } }, 'o/r');
+        assert.ok(container.includes('(container)'), container);
+        const unknown = describePackageEvent({ registry_package: { name: 'v', package_type: 'Vcpkg' } }, 'o/r');
+        assert.ok(unknown.includes('(vcpkg)'), unknown);
+        const absent = describePackageEvent({ registry_package: { name: 'v' } }, 'o/r');
+        assert.ok(!absent.includes(' ('), absent);
+    });
+
+    it('accepts the legacy top-level package key', () => {
+        const line = describePackageEvent({
+            action: 'published',
+            package: { name: 'legacy-pkg', package_type: 'nuget' }
+        }, 'o/r');
+        assert.ok(line.includes('**legacy-pkg**'), line);
+        assert.ok(line.includes('(nuget)'), line);
+    });
+
+    it('falls back to plain bold when neither html_url nor repo can supply a link', () => {
+        const line = describePackageEvent({ registry_package: { name: 'solo' } }, '');
+        assert.equal(line, '📦 updated **solo**');
+    });
+
+    it('falls back to the repo packages page for unsafe html_url values', () => {
+        const js = describePackageEvent({ registry_package: { name: 'p', html_url: 'javascript:alert(1)' } }, 'o/r');
+        assert.ok(js.includes('](https://github.com/o/r/packages)'), js);
+        const spaced = describePackageEvent({ registry_package: { name: 'p', html_url: 'https://example.com/a b' } }, 'o/r');
+        assert.ok(spaced.includes('](https://github.com/o/r/packages)'), spaced);
+    });
+
+    it('caps long versions shorter than names', () => {
+        const line = describePackageEvent({
+            registry_package: { name: 'p', package_version: { name: 'v'.repeat(60) } }
+        }, 'o/r');
+        assert.ok(line.includes('…'), line);
+        assert.ok(!line.includes('v'.repeat(41)), 'version capped at 40 chars');
+    });
+
+    it('defaults an empty action to updated and passes unknown actions verbatim', () => {
+        assert.ok(describePackageEvent({ registry_package: { name: 'p' } }, 'o/r').includes('📦 updated'));
+        assert.ok(describePackageEvent({ action: 'archived', registry_package: { name: 'p' } }, 'o/r').includes('📦 archived'));
+    });
+
+    it('never leaks prototype members through forged actions', () => {
+        const line = describePackageEvent({ action: 'constructor', registry_package: { name: 'p' } }, 'o/r');
+        assert.ok(line.includes('constructor'), line);
+        assert.ok(!line.includes('[native code]'), line);
+    });
+
+    it('returns null without a usable name or with stripped/absent package data', () => {
+        assert.equal(describePackageEvent({ registry_package: {} }, 'o/r'), null);
+        assert.equal(describePackageEvent({ registry_package: { name: '   ' } }, 'o/r'), null);
+        assert.equal(describePackageEvent({ __stripped: true }, 'o/r'), null);
+        assert.equal(describePackageEvent({}, 'o/r'), null);
+        assert.equal(describePackageEvent({ action: 'published' }, 'o/r'), null);
+        assert.equal(describePackageEvent(null, 'o/r'), null);
+    });
+});
+
+describe('attachPrContext — package stub rewrite', () => {
+    let originals;
+    let redisMock;
+
+    before(() => {
+        redisMock = makeRedisMock();
+        originals = _setInternalsForTest({ redis: redisMock });
+    });
+    after(() => {
+        _setInternalsForTest(originals || {});
+    });
+
+    function packageEnv(eventType, message, data) {
+        return {
+            type: 'msg',
+            message,
+            extra: {
+                event_type: eventType,
+                repo: 'detain/sugarcraft',
+                dedup_key: 'github:package:detain/sugarcraft:@detain/sugarcraft:2.1.0',
+                data
+            }
+        };
+    }
+
+    const PUBLISHED_DATA = {
+        action: 'published',
+        registry_package: {
+            name: '@detain/sugarcraft',
+            package_type: 'npm',
+            package_version: { name: '2.1.0' },
+            html_url: 'https://github.com/orgs/detain/packages/@detain/sugarcraft/2.1.0'
+        }
+    };
+
+    it('rewrites the registry_package stub to the described line', async () => {
+        const env = packageEnv('registry_package', PACKAGE_STUB, PUBLISHED_DATA);
+        const result = await attachPrContext(env);
+        assert.equal(result.rerouted, false);
+        assert.equal(env.message, '📦 published [**@detain/sugarcraft@2.1.0**](https://github.com/orgs/detain/packages/@detain/sugarcraft/2.1.0) (npm) on [detain/sugarcraft](https://github.com/detain/sugarcraft).');
+    });
+
+    it('rewrites the package stub under the legacy event_type too', async () => {
+        const env = packageEnv('package', PACKAGE_STUB_SHORT, PUBLISHED_DATA);
+        await attachPrContext(env);
+        assert.ok(env.message.startsWith('📦 published [**@detain/sugarcraft@2.1.0**]'), env.message);
+    });
+
+    it('keeps the stub when the payload lacks the package object (fail-soft)', async () => {
+        // Today's producer strips registry_package; old queued envelopes
+        // carry only action/repo/sender. Rendering must stay on the stub.
+        const env = packageEnv('registry_package', PACKAGE_STUB, {
+            action: 'published',
+            repository: { full_name: 'detain/sugarcraft' },
+            sender: { login: 'github-actions[bot]' }
+        });
+        await attachPrContext(env);
+        assert.equal(env.message, PACKAGE_STUB);
+    });
+
+    it('keeps the stub when the envelope data was stripped (fail-soft)', async () => {
+        const env = packageEnv('registry_package', PACKAGE_STUB, { __stripped: true, registry_package: 'oversized' });
+        await attachPrContext(env);
+        assert.equal(env.message, PACKAGE_STUB);
+    });
+
+    it('never clobbers a non-stub producer message', async () => {
+        const custom = 'Hand-crafted package announcement for 2.1.0!';
+        const env = packageEnv('registry_package', custom, PUBLISHED_DATA);
+        await attachPrContext(env);
+        assert.equal(env.message, custom);
+    });
+});
+
+describe('condensedBulletText — package branch', () => {
+    const { condensedBulletText } = consumer;
+
+    it('condenses a package event to emoji + name@version + verb', () => {
+        const bullet = condensedBulletText({
+            extra: {
+                event_type: 'registry_package',
+                repo: 'detain/sugarcraft',
+                data: {
+                    action: 'published',
+                    registry_package: {
+                        name: '@detain/sugarcraft',
+                        package_type: 'npm',
+                        package_version: { name: '2.1.0' }
+                    }
+                }
+            }
+        });
+        assert.equal(bullet, '📦 **@detain/sugarcraft@2.1.0** — published');
+    });
+
+    it('renders bare name when no version, under the legacy event_type', () => {
+        const bullet = condensedBulletText({
+            extra: { event_type: 'package', data: { action: 'updated', registry_package: { name: 'sugarcraft' } } }
+        });
+        assert.equal(bullet, '📦 **sugarcraft** — updated');
+    });
+
+    it('returns null for stripped, nameless or package-less data', () => {
+        assert.equal(condensedBulletText({ extra: { event_type: 'registry_package', data: { __stripped: true } } }), null);
+        assert.equal(condensedBulletText({ extra: { event_type: 'registry_package', data: { action: 'published', registry_package: {} } } }), null);
+        assert.equal(condensedBulletText({ extra: { event_type: 'registry_package', data: { action: 'published' } } }), null);
+    });
+});

@@ -439,17 +439,17 @@ function releaseActionVerb(action) {
 }
 
 /**
- * Strip markdown control characters from a release name/tag and cap it, so
- * payload text can never unbalance the surrounding `**bold**` / `[link](url)`
- * syntax. Returns '' for nothing renderable.
+ * Strip markdown control characters from a release/package title and cap it,
+ * so payload text can never unbalance the surrounding `**bold**` /
+ * `[link](url)` syntax. Returns '' for nothing renderable.
  */
-function sanitizeReleaseTitle(value) {
+function sanitizeReleaseTitle(value, maxLen = 80) {
     const cleaned = String(value ?? '')
         .replace(/[[\]()*~_+`\\]/g, '')
         .replace(/\s+/g, ' ')
         .trim();
     if (!cleaned) return '';
-    const capped = charCut(cleaned, 80);
+    const capped = charCut(cleaned, maxLen);
     return capped.length < cleaned.length ? `${ capped }…` : capped;
 }
 
@@ -493,6 +493,87 @@ function describeReleaseEvent(data, repo) {
     const preNote = release.prerelease ? ' _(pre-release)_' : '';
     const repoTail = repo ? ` on [${ repo }](https://github.com/${ repo }).` : '';
     return `${ emoji } ${ verb } ${ linked }${ tagNote }${ preNote }${ repoTail }`;
+}
+
+// Friendly verb per GitHub package action. Unknown actions pass through
+// verbatim — the payload's own word is more honest than a wrong mapping.
+const PACKAGE_ACTION_WORDS = {
+    published: 'published',
+    updated: 'updated',
+    deleted: 'deleted'
+};
+
+/**
+ * Display verb for a package action. Own-property lookup only: a forged or
+ * buggy `action` like "constructor" must never stringify an inherited
+ * prototype member into the message. Unknown actions pass through verbatim.
+ */
+function packageActionVerb(action) {
+    const word = String(action || '').trim();
+    if (Object.hasOwn(PACKAGE_ACTION_WORDS, word)) return PACKAGE_ACTION_WORDS[word];
+    return word || 'updated';
+}
+
+// Human label per GitHub package_type. An unlisted type falls back to the
+// lowercased raw value so the note still says something honest.
+const PACKAGE_TYPE_LABELS = {
+    npm: 'npm',
+    maven: 'maven',
+    ruby_gems: 'gems',
+    nuget: 'nuget',
+    docker: 'docker',
+    container_registry: 'container',
+    hex: 'hex',
+    actions: 'actions'
+};
+
+/**
+ * Build the descriptive one-line message for a GitHub `package` /
+ * `registry_package` event, replacing the producer's
+ * `triggered a **package** event` stub. Returns null (keep the stub) when
+ * the payload is stripped, carries no package object at all (today's
+ * producer trims `registry_package` from `extra.data`, and envelopes queued
+ * before the producer upgrade never have it — fail-soft), or lacks a usable
+ * name. Format:
+ *
+ *   📦 published [**@detain/sugarcraft@2.1.0**](https://github.com/orgs/...) (npm) on [detain/sugarcraft](https://github.com/detain/sugarcraft).
+ *
+ * The `(type)` note rides AFTER the link on purpose — parentheses inside a
+ * markdown link label break the parser (same law as release tag notes).
+ */
+function describePackageEvent(data, repo) {
+    if (!data || data.__stripped) return null;
+    const pkg = data.registry_package ?? data.package;
+    if (!pkg) return null;
+    const name = sanitizeReleaseTitle(pkg.name);
+    if (!name) return null;
+
+    const rawVersion = String(
+        pkg.package_version?.name ?? pkg.package_version?.version ?? pkg.version ?? ''
+    ).trim();
+    const version = sanitizeReleaseTitle(rawVersion, 40);
+    const label = version ? `${ name }@${ version }` : name;
+
+    const action = String(data.action || '').trim();
+    const verb = packageActionVerb(action);
+
+    const rawType = String(pkg.package_type || '').trim().toLowerCase();
+    let typeLabel = '';
+    if (rawType) {
+        typeLabel = Object.hasOwn(PACKAGE_TYPE_LABELS, rawType) ? PACKAGE_TYPE_LABELS[rawType] : rawType;
+    }
+
+    // Only an https URL without spaces/parens can ride inside the markdown
+    // link safely; anything else falls through to the repo packages page.
+    const htmlUrl = String(pkg.html_url || '').trim();
+    let url = '';
+    if (/^https:\/\/[^()\s]+$/i.test(htmlUrl)) url = htmlUrl;
+    else if (repo) url = `https://github.com/${ repo }/packages`;
+
+    const linked = url ? `[**${ label }**](${ url })` : `**${ label }**`;
+    const typeNote = typeLabel ? ` (${ typeLabel })` : '';
+    const repoTail = repo ? ` on [${ repo }](https://github.com/${ repo }).` : '';
+    return `📦 ${ verb } ${ linked }${ typeNote }${ repoTail }`;
 }
 
 /**
@@ -588,6 +669,19 @@ async function attachPrContext(env) {
     if (eventType === 'release') {
         const stubRe = /triggered\s+a\s+\*?\*?release\*?\*?\s+event/i;
         const described = describeReleaseEvent(data, repo);
+        if (described && stubRe.test(env.message || '')) {
+            env.message = described;
+        }
+        return { rerouted: false };
+    }
+
+    // package / registry_package → rewrite the producer stub into a
+    // descriptive name@version line. Same guards as release above: only the
+    // stub is replaced, custom producer text survives, and payloads without
+    // the package object fail soft to the stub via a null description.
+    if (eventType === 'package' || eventType === 'registry_package') {
+        const stubRe = new RegExp(`triggered\\s+a\\s+\\*?\\*?${ eventType }\\*?\\*?\\s+event`, 'i');
+        const described = describePackageEvent(data, repo);
         if (described && stubRe.test(env.message || '')) {
             env.message = described;
         }
@@ -708,6 +802,27 @@ function normalizeGithubDedup(it) {
         if (tagName && repo) {
             extra.dedup_key = `github:release:${ repo }:${ tagName }`;
             extra._commit_sha = `release:${ repo }:${ tagName }`;
+        }
+        return;
+    }
+
+    // package / registry_package events have no commit SHA; dedup on
+    // repo + name + version so a published/updated storm over the same
+    // version collapses into one trackable line. Without a usable name the
+    // producer's own dedup_key is left untouched (fail-soft). Sanitized
+    // values keep the key aligned with exactly what the line renders.
+    if (eventType === 'package' || eventType === 'registry_package') {
+        const pkg = data.registry_package ?? data.package;
+        const name = sanitizeReleaseTitle(pkg?.name);
+        const repo = extra.repo;
+        if (name && repo) {
+            const version = sanitizeReleaseTitle(
+                pkg.package_version?.name ?? pkg.package_version?.version ?? pkg.version ?? '',
+                40
+            );
+            const target = version || 'latest';
+            extra.dedup_key = `github:package:${ repo }:${ name }:${ target }`;
+            extra._commit_sha = `package:${ repo }:${ name }:${ target }`;
         }
         return;
     }
@@ -979,6 +1094,20 @@ function condensedBulletText(env) {
         const emoji = action.toLowerCase() === 'deleted' ? '🗑️' : (release.prerelease ? '🧪' : '🚀');
         const title = name && rawName !== rawTag ? `**${ name }** (${ tag })` : `**${ tag }**`;
         return `${ emoji } ${ title } — ${ verb }`;
+    }
+    if (eventType === 'package' || eventType === 'registry_package') {
+        // Folded package updates (published → updated) share one trackable;
+        // the bullet shows verb + name@version instead of the producer stub.
+        const pkg = data.__stripped ? null : (data.registry_package ?? data.package);
+        const name = sanitizeReleaseTitle(pkg?.name);
+        if (!name) return null;
+        const version = sanitizeReleaseTitle(
+            pkg.package_version?.name ?? pkg.package_version?.version ?? pkg.version ?? '',
+            40
+        );
+        const verb = packageActionVerb(String(data.action || '').trim());
+        const label = version ? `${ name }@${ version }` : name;
+        return `📦 **${ label }** — ${ verb }`;
     }
     return null;
 }
@@ -2952,8 +3081,8 @@ module.exports = {
     attachPrContext, recordPrBranch, lookupPrByBranch,
     prBranchKey, prNumberFromIssue, branchFromRef,
     normalizeGithubDedup,
-    // release rendering + commit-collapse helpers (also used by tests)
-    describeReleaseEvent, condensedBulletText,
+    // release + package rendering helpers (also used by tests)
+    describeReleaseEvent, describePackageEvent, condensedBulletText,
     renderTrackable, isCommitBullet, collapseCommitBullets,
     COMMIT_COLLAPSE_COUNT
 };

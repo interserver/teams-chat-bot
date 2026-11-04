@@ -747,6 +747,82 @@ describe('normalizeGithubDedup — release event dedup key', () => {
     });
 });
 
+describe('normalizeGithubDedup — package event dedup key', () => {
+    function packageEnvelope(eventType, data) {
+        return {
+            env: {
+                extra: {
+                    event_type: eventType,
+                    repo: 'detain/sugarcraft',
+                    data
+                }
+            }
+        };
+    }
+
+    const PUBLISHED = {
+        action: 'published',
+        registry_package: {
+            name: '@detain/sugarcraft',
+            package_type: 'npm',
+            package_version: { name: '2.1.0' }
+        }
+    };
+
+    it('sets github:package:{repo}:{name}:{version} dedup_key for package events', () => {
+        const it = packageEnvelope('registry_package', PUBLISHED);
+        normalizeGithubDedup(it);
+        assert.equal(it.env.extra.dedup_key, 'github:package:detain/sugarcraft:@detain/sugarcraft:2.1.0');
+        assert.equal(it.env.extra._commit_sha, 'package:detain/sugarcraft:@detain/sugarcraft:2.1.0');
+    });
+
+    it('honours the legacy package key and the package event_type', () => {
+        const it = packageEnvelope('package', {
+            action: 'updated',
+            package: { name: 'legacy', package_version: { version: '1.0.0' } }
+        });
+        normalizeGithubDedup(it);
+        assert.equal(it.env.extra.dedup_key, 'github:package:detain/sugarcraft:legacy:1.0.0');
+    });
+
+    it('falls back to "latest" when the payload carries no version', () => {
+        const it = packageEnvelope('registry_package', {
+            action: 'published',
+            registry_package: { name: 'unversioned' }
+        });
+        normalizeGithubDedup(it);
+        assert.equal(it.env.extra.dedup_key, 'github:package:detain/sugarcraft:unversioned:latest');
+        assert.equal(it.env.extra._commit_sha, 'package:detain/sugarcraft:unversioned:latest');
+    });
+
+    it('published + updated storms over one version collapse to the same key', () => {
+        const first = packageEnvelope('registry_package', PUBLISHED);
+        const second = packageEnvelope('registry_package', {
+            ...PUBLISHED,
+            action: 'updated'
+        });
+        normalizeGithubDedup(first);
+        normalizeGithubDedup(second);
+        assert.equal(first.env.extra.dedup_key, second.env.extra.dedup_key);
+    });
+
+    it('leaves the producer dedup_key untouched when the name is absent', () => {
+        const it = {
+            env: {
+                extra: {
+                    event_type: 'registry_package',
+                    repo: 'detain/sugarcraft',
+                    dedup_key: 'producer:made:this',
+                    data: { action: 'published' } // stripped/legacy payload: no package object
+                }
+            }
+        };
+        normalizeGithubDedup(it);
+        assert.equal(it.env.extra.dedup_key, 'producer:made:this');
+        assert.equal(it.env.extra._commit_sha, undefined);
+    });
+});
+
 describe('NOTIF_PR_BRANCH_TTL_MS env var', () => {
     it('defaults to 24 hours in milliseconds (86400000)', () => {
         assert.equal(NOTIF_PR_BRANCH_TTL_MS, 86400000);
